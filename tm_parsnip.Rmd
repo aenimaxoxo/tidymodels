@@ -1,0 +1,260 @@
+---
+title: "Tidy Models :: parsnip"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: darkly
+     df_print: paged
+     fig_align: center
+---
+
+# {.tabset}
+
+## Intro
+
+This is just me working through the articles at :
+
+[tidymodels :: regression](https://tidymodels.github.io/parsnip/articles/articles/Regression.html)
+
+[tidymodels :: classification](https://tidymodels.github.io/parsnip/articles/articles/Classification.html)
+
+for `parsnip` version 0.0.2. 
+
+This is also a test for Emacs ESS with Rmd support from polymode.
+
+## Load
+
+### Packages
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(AmesHousing)
+```
+### Data
+
+```{r}
+# load data
+ames <- make_ames()
+data(credit_data)
+
+# set seed for reproducibility
+set.seed(8888)
+```
+
+### Cross Validation
+
+```{r}
+# create data partitions
+data_split <- initial_split(ames, strata = "Sale_Price", p = 0.75)
+data_split_c <- initial_split(credit_data, strata = "Status", p = 0.75)
+
+# create training and testing splits
+ames_train <- training(data_split)
+ames_test <- testing(data_split)
+
+credit_train <- training(data_split_c)
+credit_test <- testing(data_split_c)
+```
+
+## Random Forests
+
+```{r}
+(rf_defaults <- rand_forest(mode = "regression"))
+```
+
+The model above will be fit with the ranger package. Since we didn't add any extra arguments to fit, many of the arguments will be set to their defaults.
+
+`parsnip` gives two different interfaces to the models: the formula and non-formula interfaces.
+    
+### Non-Formula Interface
+
+```{r}
+# set predictors
+preds <- c("Longitude", "Latitude", "Lot_Area", "Neighborhood", "Year_Sold")
+
+# fit model
+rf_xy_fit <- rf_defaults %>%
+    set_engine("ranger") %>%
+    fit_xy(
+        x = ames_train[, preds],
+        y = log10(ames_train$Sale_Price)
+)
+
+rf_xy_fit
+```
+
+The non-formula interface doesn't do anything to the predictors before giving it to the underlying model function. 
+
+This particular model does not require indicator variables to be created prior to the model. 
+
+For regression models, the basic predict method can be used and returns a tibble with a column named .pred:
+
+```{r}
+# add predictions to tibble of test data
+test_results <- ames_test %>%
+    select(Sale_Price) %>%
+    mutate(Sale_Price = log10(Sale_Price)) %>%
+    bind_cols(
+        predict(rf_xy_fit, new_data = ames_test[, preds])
+)
+
+# look at predictions
+test_results
+
+# summarize performance
+test_results %>% metrics(truth = Sale_Price, estimate = .pred) 
+```
+
+Note that: 
+
+- If the model required indicator variables, we would have to create them manually prior to using `fit` (perhaps using the recipes package).
+
+- We had to manually log the outcome prior to modeling
+
+
+### Formula Interface
+
+```{r}
+rand_forest(mode = "regression", mtry = 3, trees = 1000) %>%
+    set_engine("ranger") %>%
+    fit(
+        log10(Sale_Price) ~ Longitude + Latitude + Lot_Area + Neighborhood + Year_Sold,
+        data = ames_train
+)
+```
+
+Suppose there was some feature in the `randomForest` package that we wish to evaluate. We could do so by changing only part of the syntax.
+
+```{r}
+rand_forest(mode = "regression", mtry = 3, trees = 1000) %>%
+    set_engine("randomForest") %>%
+    fit(
+        log10(Sale_Price) ~ Longitude + Latitude + Lot_Area + Neighborhood + Year_Sold,
+        data = ames_train
+)
+```
+
+Suppose we wish to modify the value of `mtry` based on the number of predictors in the data. Usually, we would use the default value of `floor(sqrt(num_predictors))`. To use a pure bagging model would require an `mtry` value equal to the total number of parameters. There may be cases in which we don't know how many predictors are going to be present (perhaps due to the generation of indicator variables or a variable filter) so that it may be difficult to know exactly what to try. 
+    
+When the model is being fit by parsnip, data descriptors are available. These attempt to let us know what we will have available when the model is fit. When a model object is created, the values of the arguments that we give it are immediately evaluated, unless we delay them. To delay the evaluation of an argument, we can use rlang::expr to make an expression. 
+
+Two relevant descriptors are: 
+
+- **.preds()** : The number of predictor variables in the dataset that are associated with the predictors prior to dummy variable creation. 
+
+- **.cols()** : The number of predictor columns after dummy variables (or other encodings) are created. 
+
+Since range won't create indicator variables, .preds() would be appropriate for using mtry in a bagging model. 
+
+For example, lets use an expression with the .preds() descriptor to fit a bagging mode: 
+
+```{r}
+rand_forest(mode = "regression", mtry = .preds(), trees = 1000) %>%
+    set_engine("ranger") %>%
+    fit(
+        log10(Sale_Price) ~ Longitude + Latitude + Lot_Area + Neighborhood + Year_Sold,
+        data = ames_train
+)
+``` 
+## Penalized Linear Regression
+
+A linear model may work here too. The `linear_reg` model can be used. To use regularization / penalization, there are two engines that can do that here: the `glmnet` and `sparklyr` packages. The former will be used here and it only implements the non-formula method. `parsnip` will allow either to be used though. 
+
+When regularization is used, the predictors should first be centered and scaled before being given to the model. The formula method won't do that, so some other methods will be required. We will use the `recipes` package for that. 
+
+```{r}
+# build preprocessing recipe
+norm_recipe <- recipe(
+    Sale_Price ~ Longitude + Latitude + Lot_Area + Neighborhood + Year_Sold,
+    data = ames_train
+) %>%
+    step_other(Neighborhood) %>%
+    step_dummy(all_nominal()) %>%
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors()) %>%
+    step_log(Sale_Price, base = 10) %>%
+    # estimate the means and SDs
+    prep(training = ames_train, retain = TRUE)
+
+# fit the model using the processed data
+glm_fit <- linear_reg(penalty = 0.001, mixture = 0.5) %>%
+    set_engine("glmnet") %>%
+    fit(Sale_Price ~ ., data = juice(norm_recipe))
+
+glm_fit
+```
+
+If `penalty` were not specified, all of the lambda values would be computed. To get the predictions for this specific value of lambda: 
+
+```{r}
+# get processed version of test set predictors
+test_normalized <- bake(norm_recipe, new_data = ames_test, all_predictors())
+
+test_results %<>% rename(`random forest` = .pred) %>%
+    bind_cols(
+        predict(glm_fit, new_data = test_normalized) %>%
+        rename(glmnet = .pred)
+)
+
+# look at prediction comparisons
+test_results
+
+# get metrics
+test_results %>% metrics(truth = Sale_Price, estimate = glmnet)
+
+# plot
+test_results %>%
+    gather(model, prediction, -Sale_Price) %>%
+    ggplot(aes(x = prediction, y = Sale_Price)) +
+    geom_abline(col = "green", lty = 2) +
+    geom_point(alpha = 0.4) +
+    facet_wrap(~model) +
+    coord_fixed()
+```
+
+
+## Classification
+
+A single hidden layer neural network will be used to predict a person's credit status. To do so, the columns of the predictor matrix should be numeric and on a common scale.
+
+```{r}
+# create preprocessing recipe
+credit_rec <- 
+  recipe(Status ~ ., data = credit_train) %>%
+  step_knnimpute(Home, Job, Marital, Income, Assets, Debt) %>%
+  step_dummy(all_nominal(), -Status) %>%
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  prep(training = credit_train, retain = TRUE)
+
+test_normalized <- bake(credit_rec, new_data = credit_test, all_predictors())
+```
+
+`keras` will be used to fit a model with 5 hidden units with a 10% dropout rate to regularize the model. At each training iteration (epoch) a random 20% of the data will be used to measure the cross entropy of the model. 
+
+```{r}
+nnet_fit <- mlp(epochs = 100, hidden_units = 5, dropout = 0.1) %>%
+    set_engine("keras", verbose = 0, validation_split = 0.2) %>%
+    fit(Status ~ ., data = juice(credit_rec))
+
+nnet_fit
+```
+
+In `parsnip`, the `predict` function can be used: 
+
+```{r}
+test_results <- credit_test %>%
+    select(Status) %>%
+    as_tibble() %>%
+    mutate(
+        nnet_class = predict(nnet_fit, new_data = test_normalized) %>%
+            pull(.pred_class),
+        nnet_prob = predict(nnet_fit, new_data = test_normalized, type = "prob") %>% pull(.pred_good)
+)
+
+test_results %>% roc_auc(truth = Status, nnet_prob)
+test_results %>% accuracy(truth = Status, nnet_class)
+test_results %>% conf_mat(truth = Status, nnet_class)
+```

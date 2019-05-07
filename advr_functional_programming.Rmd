@@ -1,5 +1,5 @@
 ---
-title: 'Advanced R: Functional Programming'
+title: 'Functional Programming in R'
 author: "Michael Rose"
 output:
   pdf_document: default
@@ -14,7 +14,7 @@ library(furrr)
 
 ### Introduction
 
-This document is me working through the functional programming section of Advanced R. I will be using the purrr package whenever possible and the furrr package to parallelize these operations when possible / reasonable.
+This document is me working through the functional programming section of Advanced R. I will be using the purrr package whenever possible and the furrr package to parallelize these operations when possible / reasonable. 
 
 ```{r}
 # set default plan for future backend 
@@ -199,9 +199,13 @@ future_map_dbl(trims, mean, x = x)
 
 ###### 4
 
+The following code simulates the performance of a t-test for non-normal data. Extract the p-value from each test, then visualise.
+
 ```{r}
 trials <- future_map(1:100, ~ t.test(rpois(10, 10), rpois(7, 10)))
+```
 
+```{r}
 p_values <- trials %>% future_map_dbl(~ pluck(.x, 3))
 
 p_values %>% as.tibble() %>% 
@@ -212,6 +216,8 @@ p_values %>% as.tibble() %>%
 
 ##### 6
 
+Use map() to fit linear models to the mtcars dataset using the formulas stored in this list:
+
 ```{r}
 formulas <- list(
   mpg ~ disp, 
@@ -219,13 +225,18 @@ formulas <- list(
   mpg ~ disp + wt,
   mpg ~ I(1 / disp) + wt
 )
+```
 
+```{r}
 mtcars_lms <- future_map(formulas, ~ lm(mtcars, formula = .x))
 
 mtcars_lms
 ```
 
 ##### 7
+
+Fit the model mpg ~ disp to each of the bootstrap replicates of mtcars in the list below, then extract the R2 of the model fit (Hint: you can compute the R2 with summary())
+
 
 ```{r}
 bootstrap <- function(df){
