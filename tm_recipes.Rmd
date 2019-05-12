@@ -1,0 +1,1568 @@
+---
+title: "Tidy Models :: recipes"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# {.tabset}
+
+## Intro
+
+The `recipes` package is an alternative method for creating and preprocessing design matrices that can be used for modeling or visualization. 
+
+The idea of the `recipes` package is to define a recipe or blueprint that can be used to sequentially define the encodings and preprocessing of the data (i.e. feature engineering).
+
+This is me working through the articles found at: 
+
+[tidymodels :: recipes](https://tidymodels.github.io/recipes/)
+
+### Load Libraries
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(magrittr)
+```
+
+## Simple Example
+
+**Variables** are the original raw data columns in a data frame or tibble.  For example, in `Y ~ A + B + A:B`, the variables are Y, A, B.
+
+**Roles** define how variables are used in the model. Examples are predictor, response, and case weight.
+
+**Terms** are columns in a design matrix such as A, B, and A:B. These can be other derived entities that are grouped such as a set of principal components or a set of columns that define a basis function for a variable. 
+
+The recipes package contains a data set that can be used to predict whether a person will pay back a bank loan. 
+
+```{r}
+# load data
+data("credit_data")
+
+# set seed for reproducibility
+set.seed(8888)
+
+# set training / test split
+train_test_split <- initial_split(credit_data)
+credit_train <- training(train_test_split)
+credit_test <- testing(train_test_split)
+```
+
+### Check for Missing Data
+
+```{r}
+map_dbl(credit_train, ~ mean(!is.na(.)), numeric(1))
+```
+
+Note that some of the values are missing. Rather than remove them, we can impute their values. The idea is that the preprocessing operations will all be created using the training set and then these steps will be applied to both the training and test set.
+
+### An Initial Recipe
+
+First, we will create a recipe object from the original data and then specify the preprocessing steps. If the analysis required outcomes and predictors, the easiest way to create the intial recipe is to use the standard formula method.
+
+```{r}
+(rec_obj <- recipe(Status ~ ., data = credit_train))
+```
+
+### Preprocessing Steps
+
+From here, preprocessing steps for some X can be added sequentially in one of two ways: 
+
+```{r, eval = FALSE}
+rec_obj <- step_{X}(rec_obj, arguments) # OR 
+rec_obj %<>% step_{X}(arguments)
+```
+
+One other important facet of the code is the method for specifying which variables should be used in different steps. The manual page `?selections` has more details, but dplyr like selector functions can be used: 
+
+- Use basic variable names (e.g. `x1`, `x2`)
+
+- dplyr functions for selecting variables: `contains`, `ends_with`, `everything`, `matches`, `num_range`, and `starts_with`
+
+- functions that subset on the role of the variables that have been specified so far: `all_outcomes`, `all_predictors`, `has_role`, or
+
+- similar functions for the type of data: `all_nominal`, `all_numeric`, `has_type`
+
+For our data, we can add an operation to impute the predictors. There are many ways to do this and recipes includes a few steps for this purpose: 
+
+```{r}
+grep("impute$", ls("package:recipes"), value = T)
+```
+
+Here, k-nearest-neighbor imputation will be used. This works for both numeric and non numeric predictors and defaults K to 5. To do this, it selects all predictors and then remove those that are numeric. 
+
+```{r}
+rec_obj %>%
+    step_knnimpute(all_predictors()) -> imputed
+
+imputed
+```
+
+It is important to realize that the specific variables have not been declared yet (as shown when the recipe is printed above). In some preprocessing steps, variables will be added or removed from the current list of possible values. 
+
+Some predictors are categorical in nature (i.e. nominal). It would make sense of convert these factor predictors into numeric dummy variables using `step_dummy`. To do this, the step selects all predictors then removes those that are numeric: 
+
+```{r}
+imputed %>%
+    step_dummy(all_predictors(), - all_numeric()) -> ind_vars
+
+ind_vars
+```
+
+At this point in the recipe, all of the predictors should be encoded as numeric. We can furthermore add steps to center and scale them: 
+
+```{r}
+ind_vars %>%
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors()) -> standardized
+
+standardized
+```
+
+If there are only preprocessing steps for the predictors, we can now estimate the means and standard deviations from the training set. The `prep` function is used with a recipe and a data set: 
+
+```{r}
+(trained_rec <- prep(standardized, training = credit_data))
+```
+
+Note that the real variables are listed instead of the selectors. Now that the statistics have been estimated, the preprocessing can be applied to the training and test set: 
+
+```{r}
+train_data <- bake(trained_rec, new_data = credit_train)
+test_data <- bake(trained_rec, new_data = credit_test)
+```
+
+bake returns a tibble that, by default, includes all of the variables
+
+```{r}
+# check test data class
+class(test_data)
+
+# look at data
+test_data %>% head()
+
+# check for missing values
+map_dbl(test_data, ~ mean(!is.na(.), numeric(1)))
+```
+
+There are a number of other steps included in the package: 
+
+```{r}
+grep("step_", ls("package:recipes"), value = T)
+```
+
+### Checks 
+
+Another type of operation that can be added to a recipe is a check. Checks conduct some sort of data validation, and if no issue is found, returns the data as is - otherwise an error is thrown. 
+
+For example, check_missing will fail if any of the variables selected for validation have missing values. This check is done when the recipe is prepared as well as when any data is baked. Checks are added in the same way as steps: 
+
+```{r}
+trained_rec %>%
+    check_missing(contains("Martial"))
+```
+Currently recipes includes: 
+
+```{r}
+grep("check_", ls("package:recipes"), value = T)
+```
+
+## Selecting Variables 
+
+When recipe steps are used, there are different approaches that can be used to select which variables or features should be used. 
+
+The three main characteristics of variables that can be queried: 
+
+- The name of the variable
+- The data type
+- The role that was declared by the recipe
+
+The manual pages for `?selections` and `?has_role` have details about the available selection methods.
+
+To illustrate this, we will again use the credit data: 
+
+```{r}
+# look at data
+credit_data %>% glimpse()
+
+# create formula for recipe
+(rec <- recipe(Status ~ Seniority + Time + Age + Records, data = credit_data))
+```
+
+Before any steps are used, the information on the original variables is 
+
+```{r}
+rec %>% summary(original = TRUE)
+```
+
+We can add a step to compute dummy variables on the non numeric data after we impute any missing data. Since Status is an outcome, we may want to keep it as a factor so we can subtract that variable out either by name or by role. 
+
+```{r}
+rec %>%
+    step_dummy(all_nominal(), - Status) %>%
+    prep(training = credit_data) %>%
+    bake(new_data = credit_data) -> with_dummy
+
+with_dummy %>% head()
+```
+
+One important aspect about selecting variables in steps is that the variable names and types may change as steps are being executed. In the above example, `Records` is a factor variable before the step is executed. Afterward `Records` is gone and the binary variable `Records_yes` is in its place. One reason to have general selection routines like `all_predictors` or `contains` is to be able to select variables that have not been created yet. 
+
+## Custom Step Functions
+
+We may need to define our own operations. This page describes how to do that. For checks, the process is very similar. 
+
+### A New Step Definition
+
+As an example, let's create a step that replaces the value of a variable with its percentile from the training set. The data we will use is from the recipes package. 
+
+```{r}
+data(biomass)
+
+biomass %>% glimpse()
+```
+
+Since it already comes split into training and test sets, we can separate them with indices: 
+
+```{r}
+biomass_tr <- biomass[biomass$dataset == "Training",]
+biomass_te <- biomass[biomass$dataset == "Testing",]
+```
+
+To illustrate the transformation with the `carbon` variable, the training set distribution of those variables is shown below with a vertical line for the first value of the test set
+
+```{r}
+biomass_tr %>%
+    ggplot(aes(x = carbon)) +
+    geom_histogram(binwidth = 5, col = "blue", fill = "blue", alpha = 0.5) +
+    geom_vline(xintercept = biomass_te$carbon[1], lty = 2)
+```
+
+Based on the training set, 42.1% of the data is less than a value of 46.35. There are some applications where it might be advantageous to represent the predictor values as percentiles rather than their original values. 
+
+Our new step will do this computation for any numeric variables of interest. We will call this `step_percentile`. The code below is designed for illustration and not speed or best practices. In a real implementation we would want more error trapping. 
+
+### Create Initial Function
+
+The user-exposed function `step_percentile` is just a simple wrapper around an internal function called `add_step`. This function takes the same arguments as our function and simply adds it to a new recipe. The `...` signifies the variable selectors that can be used. 
+
+```{r}
+step_percentile <- function(
+                            recipe, ...,
+                            role = NA,
+                            trained = FALSE,
+                            ref_dist = NULL,
+                            approx = FALSE,
+                            options = list(probs = (0:100)/100, names = TRUE),
+                            skip = FALSE,
+                            id = rand_id("percentile")
+) {
+    # The variable selectors are not immediately evaluated by using the `quos` function in rland. `ellipse_check` captures the values are also checks to make sure that they are not empty.
+    terms <- ellipse_check(...)
+
+    add_step(
+        recipe,
+        step_percentile_new(
+            terms = terms,
+            trained = trained,
+            role = role,
+            ref_dist = ref_dist,
+            approx = approx,
+            options = options,
+            skip = skip,
+            id = id
+)
+)
+}
+```
+
+We should always keep the first four arguments (recipe through trained) the same as listed above. Some notes: 
+
+- The role arg is used when you either: 
+  1. Create new variables and want their role to be pre-set 
+  2. Replace the existing variables with new values. This is what we will be doing and using `role = NA` will leave the existing role intact. 
+
+- trained is set by the packages when the estimation step has been run. We should default our function definitions argument to false
+
+- skip is a logical. Whenever a recipe is prepped, each step is trained and then basked. However, there are some steps that should not be applied when a call to bake is used. For example, if a step is applied to the variables with roles of outcomes, these data would not be available for new samples.
+
+- id is a character string that can be used to identify steps in package code
+
+
+Extra arguments specific to the step have been added. In order to calculate the percentile, the training data for the relevant columns will need to be saved. This data will be saved in the `ref_dist` object. However, this may be problematic if the data set is large. `approx` would be used when we wish to save a grid of pre-computed percentiles from the training set and use these to estimate the percentile for a new data point. If `approx = TRUE`, the argument `ref_dist` will contain the grid for each variable. 
+
+We will use `stats::quantile` to compute the grid. The options argument will give us control over the granularity of the grid.  We could just use the ellipses so that any options passed to `step_percentile`that are not one of its arguments will then be passed to `stats::quantile`. 
+
+### Initialization of New Objects
+
+Next we can utilize the internal function step that sets the class of new objects. Using `subclass = "percentile"` will set the call of new objects to `"step_percentile"`.
+
+
+```{r}
+step_percentile_new <- function(terms, role, trained, ref_dist, approx, options, skip, id) {
+    step(
+        subclass = "percentile",
+        terms = terms,
+        role = role,
+        trained = trained,
+        ref_dist = ref_dist,
+        approx = approx,
+        options = options,
+        skip = skip,
+        id = id
+)
+} 
+```
+
+The constructor function should have no default argument values. 
+
+### Def the Estimation Procedure
+
+We need to create a new `prep` method for our step's class. To do this, there are three arguments that the method should have: 
+
+```
+function(x, training, info = NULL)
+```
+
+where 
+
+- `x` will be the `step_percentile` object
+- `training` will be a tibble that has the training set data
+- `info` will also be a tibble that has information on the current set of data available. This information is updated as each step is evaluated by its specific prep method so it may not have variables from the original data. 
+
+The first thing that we might want to do in the prep function is to translate the specification listed in the terms argument to column names in the curent data. There is an internal function called terms_select that can be used to obtain this. 
+
+```{r}
+prep.step_percentile <- function(x, training, info = NULL) {
+    col.names <- terms_select(terms = x$terms, info = info)
+}
+```
+
+Once we have this, we can either save the original data columns or estimate the approximation grid. For the grid, we will use a helper function that enables us to run `do.call` on a list of arguments that include the options list. 
+
+```{r}
+get_pctl <- function(x, args) {
+  args$x <- x
+  do.call("quantile", args)
+}
+
+prep.step_percentile <- function(x, training, info = NULL, ...) {
+  col_names <- terms_select(terms = x$terms, info = info) 
+  ## You can add error trapping for non-numeric data here and so on. See the
+  ## `check_type` function to do this for basic types. 
+  
+  ## We'll use the names later so
+  if (x$options$names == FALSE)
+    stop("`names` should be set to TRUE", call. = FALSE)
+  
+  if (!x$approx) {
+    ref_dist <- training[, col_names]
+  } else {
+    ref_dist <- purrr::map(training[, col_names],  get_pctl, args = x$options)
+  }
+
+  ## Use the constructor function to return the updated object. 
+  ## Note that `trained` is set to TRUE
+  
+  step_percentile_new(
+    terms = x$terms, 
+    trained = TRUE,
+    role = x$role, 
+    ref_dist = ref_dist,
+    approx = x$approx,
+    options = x$options,
+    skip = x$skip,
+    id = x$id
+  )
+}
+```
+
+### Create the Bake Method
+
+Remember that the prep function does not apply the step to the data; it only estimates any required values such as `ref_dist`. We will need to create a new method for our `step_percentile` class. The minimum arguments for this are
+
+```
+function(object, new_data, ...)
+```
+
+where object is the updated step function that has been through the corresponding prep code and new_data is a tibble of data to be processed.
+
+Here is the code to convert the new data to percentiles. Two initial helper functions handle the two cases (approximation or not). We always return a tibble as the output. 
+
+```{r}
+# two helper functions
+pctl_by_mean <- function(x, ref) {
+    mean(ref <= x)
+}
+
+pctl_by_approx <- function(x, ref) {
+    # go from 1 column tibble to vector
+    x <- getElement(x, names(x))
+    # get the percentiles values from the names (e.g. "10%")
+    p_grid <- as.numeric(gsub("%$", "", names(ref)))
+    approx(x = ref, y = p_grid, xout = x)$y/100
+}
+
+# bake step
+bake.step_percentile <- function(object, new_data, ...) {
+    require(tibble)
+    # for illustration we will loop through the affected variables and do the computations
+    vars <- names(object$ref_dist)
+
+    for (i in vars) {
+        if (!object$approx) {
+            # we can use apply since tibbles do not drop dimensions
+            new_data[, i] <- apply(new_data[, i], 1, pctl_by_mean,
+                                   ref = object$ref_dist[, i])
+        } else {
+            new_data[, i] <- pctl_by_approx(new_data[, i], object$ref_dist[[i]])
+        }
+    }
+    # always convert to tibbles on the way out
+    as_tibble(new_data)
+}
+
+```
+
+### Running the Example 
+
+Let's run the example to make sure it works. 
+
+```{r}
+rec_obj <- recipe(HHV ~ ., data = biomass_tr[, -(1:2)]) %>%
+    step_percentile(all_predictors(), approx = TRUE) %>%
+    prep(training = biomass_tr)
+
+(percentiles <- bake(rec_obj, biomass_te))
+```
+
+## Step Ordering
+
+Some general suggestions: 
+
+- If using a Box-Cox transformation, don't cetner the data first or do any operations that may make the data nonpositive. Alternatively, use the Yeo-Johnson transformation so we don't have to worry about this. 
+
+- Recipes do not automatically create dummy varibles. If we wish to center, scale, or do any other operations on all of the predictors, run `step_dummy` first.
+
+- You should make dummy variables before creating interactions with `step_interact`
+
+- If we are lumping infrequent categories together with step_other, call it before step_dummy 
+
+While each project's needs vary, here is a suggested order of potential steps that should work for most problems: 
+
+1. Impute
+2. Individual transformations for skewness and other issues
+3. Discretize (if needed)
+4. Create dummy variables
+5. Create interactions 
+6. Normalize steps (center, scale, range, etc)
+7. Multivariate transformation (e.g. PCA, spatial sign, etc)
+
+## Categorical Predictors
+
+This section describes the different methods for encoding categorical predictors with special attention to interaction terms and contrasts. 
+
+### Creating Dummy Variables
+
+Let's start with the Iris data. 
+
+```{r}
+# make a copy for use below
+iris %<>% mutate(original = Species) 
+
+# make recipe
+iris_rec <- recipe(~ ., data = iris)
+
+iris_rec %>% summary()
+```
+
+A contrast function in R is a method for translating a column with categorical values into one or more numeric columns that take place of the original. This can also be known as an encoding method or a parameterization function. 
+
+The default approach is to create dummy variables using the reference cell parameterization. This means that if there are $C$ levels of the factor, there will be $C - 1$ dummy variables created and all but the first factor level are made into new columns: 
+
+```{r}
+# split species up
+iris_rec %>%
+    step_dummy(Species) %>%
+    prep(training = iris, retain = TRUE) -> ref_cell
+
+ref_cell %>% summary()
+
+# get a row for each factor level
+juice(ref_cell, original, starts_with("Species")) %>% distinct()
+```
+
+Note that the column that was used to make the new columns (SPecies) is no longer there. 
+
+There are different types of contrasts that can be used for different types of factors. The defaults are:
+
+```{r}
+getOption("contrasts")
+```
+
+Looking at `?contrast`, there are other options. One alternative is the little known Helmert contrast: 
+
+> contr.helmert returns Helmert contrasts, which contrast the second level with the first, the third with the average of the first two, and so on
+
+To get this encoding, the gloval option for the contrasts can be changed and saved. `step_dummy` picks up on this and makes the correct calculations. 
+
+```{r}
+# change it
+go_helmert <- getOption("contrasts")
+go_helmert["unordered"] <- "contr.helmert"
+options(contrasts = go_helmert)
+
+# now make dummy variables with new parameterization
+helmert <- iris_rec %>%
+    step_dummy(Species) %>%
+    prep(training = iris, retain = TRUE)
+
+helmert %>% summary()
+
+juice(helmert, original, starts_with("Species")) %>% distinct()
+```
+
+Looks pretty bad. 
+
+```{r}
+# go back to original
+options(contrasts = getOption("contrasts"))
+```
+
+### Interactions with Dummy Variables
+
+Creating interactions with recipes requires the use of a model formula, such as
+
+```{r}
+iris_rec %>%
+    step_interact(~ Sepal.Width:Sepal.Length) %>%
+    prep(training = iris, retain = TRUE) -> iris_int
+
+iris_int %>% summary()
+```
+
+In R model formulae, using a * between two variables would expand to a*b = a + b + a:b so that the main effects are included. In `step_interact`, you can use *, but only the interactions are recorded as columns that need to be created.
+
+One thing that recipes does different than base R is to construct the design matrix in sequential iterations. This is relevant when thinking about interactions between continuous and categorical predictors. 
+
+For example, if you were to use the standard formula interface, the creation of dummy variables happens at the same time as the interactions are created: 
+
+```{r}
+# base R version
+model.matrix(~ Species*Sepal.Length, data = iris) %>%
+    as.data.frame() %>%
+    slice(c(1, 51, 101)) %>%
+    as.data.frame()
+```
+
+With recipes, you create them sequentially. This raises an issue: Do I have to type out all of the interaction effects by their specific names when using a dummy variable? 
+
+```{r}
+iris_rec %>%
+    step_interact(~ Species_versicolor:Sepal.Length +
+                    Species_virginica:Sepal.Length)
+```
+
+Not only is this a pain, but it may not be obvious what dummy variables are available (especially when step_other is used). The solution is to use a selector: 
+
+```{r}
+iris_rec %>%
+    step_dummy(Species) %>%
+    step_interact(~ starts_with("Species"):Sepal.Length) %>%
+    prep(training = iris, retain = TRUE) -> iris_int
+
+iris_int %>% summary()
+```
+
+### Warning! 
+
+Would it work if I didn't convert species to a factor and use the interactions step? 
+
+```{r}
+iris_rec %>%
+    step_interact(~ Species:Sepal.Length) %>%
+    prep(training = iris, retain = TRUE) %>%
+    summary()
+```
+
+The column Species isn't affected and a warning is issued. Basically, we only get half of what model.matrix does and that could be problematic in subsequent steps. 
+
+### Getting All of the Indicator Variables
+
+As mentioned before, if there are $C$ levels of the factor, there will be $C-1$ dummy variables created. We may want to get all of them back. 
+
+Historically, $C-1$ are used so that a linear dependency is avoided in the design matrix; all $C$ dummy variables would add up row wise to the intercept column and the inverse matrix for linear regression can't be computed. The technical term for a design matrix like this is "less than full rank". 
+
+There are models that can avoid this issue (e.g. glmnet and others), so we may want to get all the columns. To do this, `step_dummy` has an option called `one_hot` that will make sure that all $C$ are produced. 
+
+```{r}
+iris_rec %>%
+    step_dummy(Species, one_hot = TRUE) %>%
+    prep(training = iris, retain = TRUE) %>%
+    juice(original, starts_with("Species")) %>%
+    distinct()
+```
+
+**Warning! (again)**
+
+This will give us a full set of indicators, and when you use the typical contrast function, it does. It might do some seemingly weird things when used with other contrasts: 
+
+```{r}
+iris_rec %>% 
+  step_dummy(Species, one_hot = TRUE) %>%
+  prep(training = iris, retain = TRUE) %>%
+  juice(original, starts_with("Species")) %>%
+  distinct() -> hot_reference
+
+hot_reference
+
+# set to helmert contrasts
+options(contrasts = go_helmert)
+
+# try out helmert contrasts
+iris_rec %>% 
+  step_dummy(Species, one_hot = TRUE) %>%
+  prep(training = iris, retain = TRUE) %>%
+  juice(original, starts_with("Species")) %>%
+  distinct() -> hot_helmert
+
+hot_helmert
+```
+
+Since this contrast doesn't make sense using all $C$ columns, it reverts back to the default encoding. 
+
+### Novel Levels
+
+When a recipe is used with new samples, some factors may have acquired new levels that were not present when prep was run. If step_dummy encounters this situation, a warning is issued and the indicator variables that correspond to the factor are assigned missing values. 
+
+One way around this is to use `step_other`, which will convert infrequently occuring levels to a new category. This step can also be used to convert new factor levels to other also. 
+
+Also `step_integer` has functionality similar to `LabelEncoder` that encodes new values as zero. 
+
+The `embed` package can also handle novel factors levels within a recipe. `step_embed` and `step_tfembed` assign a common numeric score to novel levels. 
+
+### Other Steps Related to Dummy Variables
+
+- `step_other` : collapse infrequently occuring levels into other
+- `step_regex` : create a single dummy var based on apply a regular expression to a text field
+- `step_count` : same as above, but counts occurrences of the pattern in the string 
+- `step_holiday` : creates dummy variables from date fields to capture holidays
+- `step_lincomb` : useful is you over-specify interactions and need to remove linear dependencies
+- `step_zv` : remove dummy variables that never show a 1 in the column 
+- `step_bin2factor` : takes a binary indicator and makes a factor variable. This can be useful when using naive bayes models
+- `step_embed, step_lencode_glm, step_lencode_bayes` and others in the embed package can use one or more values to encode factor predictors into numeric form
+- `step_dummy` also works for ordered factors. There are also a few other steps for ordered factors: 
+  - `step_ordinalscore` can translate the levels to a single numeric score
+  - `step_unorder` can convert to an unordered factor
+  
+## Roles
+
+`recipes` can assign one or more roles to each column in the data. The roles are not restricted to a predefined set; they can be anything. For most conventional situations, they are typically "predictor" and/or "outcome". 
+
+### The Formula Method
+
+When a recipe is created using the formula interface, this defines the roles for all columns of the data set. `summary()` can be used to view a tibble containing information regarding the roles. 
+
+```{r}
+recipe(Species ~ ., data = iris) %>% summary()
+
+recipe(~ Species, data = iris) %>% summary()
+
+recipe(Sepal.Length + Sepal.Width ~ ., data = iris) %>% summary()
+```
+
+These roles can be updated despite this initial assignment. `update_role()` can modify a single existing role: 
+
+```{r}
+recipe(HHV ~ ., data = biomass) %>%
+    update_role(dataset, new_role = "dataset split variable") %>%
+    update_role(sample, new_role = "sample ID") %>%
+    summary()
+```
+
+When you want to get rid of a role for a column, use `remove_role()`. 
+
+```{r}
+recipe(HHV ~ ., data = biomass) %>%
+    remove_role(sample, old_role = "predictor") %>%
+    summary()
+```
+
+It represents the lack of a role as NA, which means that the variable is used in the recipe, but does not yet have a declared role. Setting the role manually to NA is not allowed.
+
+When there are cases when a column will be used in more than one context, `add_role()` can create additional roles: 
+
+```{r}
+multi_role <- recipe(HHV ~ ., data = biomass) %>%
+    update_role(dataset, new_role = "dataset split variable") %>%
+    update_role(sample, new_role = "sample ID") %>%
+    add_role(sample, new_role = "jellyfish")
+
+multi_role %>% summary()
+```
+
+If a variable has multiple existing roles and you want to update one of them, the additional `old_role` argument to `update_role()` must be used to resolve any ambiguity. 
+
+```{r}
+multi_role %>%
+    update_role(sample, new_role = "flounder", old_role = "jellyfish") %>%
+    summary()
+```
+
+### The Non-Formula Interface
+
+You can start a recipe without any roles: 
+
+```{r}
+recipe(biomass) %>%
+    summary()
+```
+
+and roles can be added in bulk as needed
+
+```{r}
+recipe(biomass) %>%
+    update_role(contains("gen"), new_role = "lunchroom") %>%
+    update_role(sample, HHV, new_role = "snail") %>%
+    summary()
+```
+
+### Role Inheritance
+
+All recipe steps have a role argument that lets you set the role of new columns generated by the step. When a recipe modifies a column in place, the role is never modified. 
+
+For example, `?step_center` has the documentation: 
+
+> role: Not used by this step since no new variables are created
+
+In other cases, the roles are defaulted to a relevant value based on the context. For example, `?step_dummy` has 
+
+> role: For model terms created by this step, what analysis role should they be assigned? By default, the function assumes that the binary dummy variable columns created by the original values will be used as predictors in a model. 
+
+So, by default, they are predictors, but don't have to be: 
+
+```{r}
+recipe(~ ., data = iris) %>%
+    step_dummy(Species) %>%
+    prep() %>%
+    juice(all_predictors()) %>%
+    dplyr::select(starts_with("Species")) %>%
+    names()
+
+recipe(~ ., data = iris) %>%
+    step_dummy(Species, role = "trousers") %>%
+    prep() %>%
+    juice(has_role("trousers")) %>%
+    names()
+```
+
+## Skipping Steps 
+
+When steps are created in a recipe, they can be applied to the data (i.e. baked) at two distinct times: 
+
+1. During the process of preparing the recipe, each step is estimated via prep and then applied to the training set using bake before proceeding to the next step. 
+
+2. After the recipe has been prepared, bake can be used with any data set to apply the preprocessing to the data. 
+
+There are times where we would like to circumvent baking on a new data set (i.e. number 2 above). For example: 
+
+- There are outcomes in the recipe that won't be available when a recipe is baked in the future. For predictive modeling, this is common when you receive new data to be predicted.
+
+- When doing resampling or a training / test split, certain operations make sense for the data to be used for modeling but are problematic for new samples or the test set. 
+
+### Example: Class Imbalance Sampling and Skipping Steps
+
+Consider the problem of a severe class imbalance. Suppose we have a 2 class problem, and one of the classes only occurs 5% of the time. We could downsample the first class as a way to deal with this. 
+
+The important consideration when doing this is to make sure that the preprocessing is only applied to the training set so that it can impact the model fit. The test set should be unaffected by this operation. 
+
+### How to Skip Steps 
+
+Each step has an optional logical argument called `skip`. In almost every case, the default value is false. When using an option with skip = true, these steps are not applied to the data when bake is called. 
+
+Recall that there are two ways of getting the results for the training set with recipes. First, bake can be used as usual. Second, juice is a shortcut that will use the already processed data that is contained in the recipe when prep(recipe, retain = TRUE) is used. `juice` is much faster and would be the way to get the training set with all of the steps applied to the data. For this reason, you should almost always use retain = TRUE if any steps are skipped (and a warning is produced otherwise). 
+
+### Be Careful!
+
+Skipping can be dangerous if used carelessly. As an example, skipping an operation whose variables are used later may be an issue. 
+
+```{r}
+car_recipe <- recipe(mpg ~ ., data = mtcars) %>%
+    step_log(disp, skip = TRUE) %>%
+    step_center(all_predictors()) %>%
+    prep(training = mtcars, retain = TRUE)
+
+# these should produce the same results (as they do for `hp`)
+juice(car_recipe) %>% head() %>% dplyr::select(disp, hp)
+
+bake(car_recipe, new_data = mtcars) %>% head() %>% dplyr::select(disp, hp)
+
+```
+
+This should emphasize that `juice` should be used to get the training set values whenever a step is skipped. 
+
+## Class Imbalances
+
+Consider a two class problem where the first class has a very low rate of occurrence. The caret package has a function that can simulate such data.
+
+```{r}
+set.seed(8888)
+
+imbal_data <- caret::twoClassSim(1000, intercept = 10)
+table(imbal_data$Class)
+```
+
+If class1 is the event of interest, we would get very good specificity since almost all of the data is in the second class. Sensitivity will often be poor since the models will optimize accuracy (or other loss functions) by predicting everything to be the majority class.
+
+When there are two classes, the result is that the default probability cutoff of 50% is inappropriate; a different cutoff is needed to achieve good performance. One way to alleviate this issue is to subsample the data. The simplest way to do this is to sample down the majority class data until it occurs with the same frequency as the minority class. 
+
+To demonstrate this, `step_downsample` will be used in a recipe for the simulated data. In terms of workflow: 
+
+- It is extremely important that subsampling occurs inside of resampling. Otherwise the resampling process can produce poor estimates of model performance.
+
+- The subsampling process should only be applied to the analysis set. The assessment set should reflect the event rates seen in the wild, and for this reason the skip argument to step_downsample is defaulted to TRUE. 
+
+Here is a simple recipe: 
+
+```{r}
+# def recipe
+recipe(Class ~ ., data = imbal_data) %>%
+  step_downsample(Class) -> imbal_rec
+
+# CV to resample the model
+cv_folds <- vfold_cv(imbal_data, strata = "Class", repeats = 5)
+
+# add column to the data with trained recipes for each resample
+cv_folds %<>% mutate(recipes = purrr::map(splits, prepper, recipe = imbal_rec, retain = TRUE))
+
+cv_folds$recipes[[1]]
+
+```
+
+The model that will be used to demonstrate subsampling is `quadratic discriminant analysis` via the MASS package. A function will be used to train the model and to produce class probabilities as well as hard class predictions using the default 50% cutoff. When a recipe is passed to the function, down-sampling will be applied. If no recipe is given, the data is used to fit the model as is: 
+
+
+```{r}
+
+assess_res <- function(split, rec = NULL, ...) {
+  if (!is.null(rec))
+    mod_data <- juice(rec)
+  else
+    mod_data <- analysis(split)
+  
+  mod_fit <- MASS::qda(Class ~ ., data = mod_data)
+  
+  if (!is.null(rec))
+    eval_data <- bake(rec, assessment(split))
+  else
+    eval_data <- assessment(split)
+  
+  eval_data <- eval_data 
+  predictions <- predict(mod_fit, eval_data)
+  eval_data %>%
+    mutate(
+      pred = predictions$class,
+      prob = predictions$posterior[,1]
+    ) %>%
+    dplyr::select(Class, pred, prob)
+}
+
+# for example
+
+# no subsampling
+assess_res(cv_folds$splits[[1]]) %>% head()
+
+# with subsampling
+assess_res(cv_folds$splits[[1]], cv_folds$recipes[[1]]) %>% head()
+
+```
+
+To measure model effectiveness, two metrics are used: 
+
+- The area under the ROC curve is an overall assessment of performance across all cutoffs. Values near one indicate very good results while values near 0.05 would imply that the model is very poor. 
+
+- The $J$ index (aka Youden's J statistic) is sensitivity + specificity - 1. Values near 1 and once again best. 
+
+If a model is poorly calibrated, the ROC curve value might not show diminished performance. The J index would be lower for models with pathological distributions for class probabilities. The `yardstick` package will be used to compute these metrics. 
+
+We train the models and generate the predictions. These are stored in list columns where each list element is a data frame of the predictions on the assessment data. 
+
+```{r}
+(cv_folds %<>% mutate(
+                   sampled_pred = map2(splits, recipes, assess_res),
+                   normal_pred = map(splits, assess_res)
+               ))
+```
+
+Now the performance metrics are computed: 
+
+```{r}
+# This works fine when ran in the editor, but won't knit
+
+## library(yardstick)
+
+## cv_folds %<>%
+##     mutate(
+##         sampled_roc = map_dfr(sampled_pred, roc_auc, Class, prob) %>%
+##             pull(".estimate"),
+##         normal_roc = map_dfr(normal_pred, roc_auc, Class, prob) %>%
+##             pull(".estimate"),
+##         sampled_J = map_dfr(sampled_pred, j_index, Class, pred) %>%
+##             pull(".estimate"),
+##         normal_J = map_dfr(normal_pred, j_index, Class, pred) %>%
+##             pull(".estimate")
+##     )
+
+
+
+```
+
+What do the ROC values look like? We can use a Bland-Altman plot to show the differences over a range of results. 
+
+```{r}
+
+## cv_folds %>%
+##     ggplot(aes(x = (sampled_roc + normal_roc) / 2,
+##                y = sampled_roc - normal_roc)) +
+##     geom_point() +
+##     geom_hline(yintercept = 0, col = "green")
+
+```
+
+It doesn't appear that subsampling has much of an effect on this metric. The average difference is -0.015, which is fairly small. 
+
+For the J statistic, the results show a different story
+
+```{r}
+
+## cv_folds %>%
+##     ggplot(aes(x = (sampled_J + normal_J)/2,
+##                y = sampled_J - normal_J)) +
+##     geom_point() +
+##     geom_hline(yintercept = 0, col = "green")
+
+```
+
+Almost all of the differences are greater than zero. We can use `tidyposterior` to do a more formal analysis.
+
+```{r}
+## library(tidyposterior)
+
+## # remove all cols except resample info and the J indices, then fit the bayesian model
+## cv_folds %>%
+##     dplyr::select(-recipes, -matches("pred$"), -matches("roc$")) %>%
+##     perf_mod(seed = 8888, iter = 5000) -> j_mod
+
+```
+
+A simple plot of the posterior distributions for the $J$ indices for each model shows that there is a real difference; subsampling the data prior to modeling produced better calibrated models.
+
+```{r}
+
+## j_mod %>%
+##     tidy(seed = 8888) %>%
+##     ggplot()
+
+```
+
+## Partial Least Squares
+
+Multivariate Analysis usually refers to the situation where multiple outcomes are being modeled, analyzed, or predicted. There are multivariate versions of many common statistical tools. 
+
+The data that we will use has three outcomes. From `?tecator`:
+
+> "These data are recorded on a Tecator Infratec Food and Feed Analyzer working in the wavelength range 850 - 1050 nm by the Near Infrared Transmission (NIT) principle. Each sample contains finely chopped pure meat with different moisture, fat and protein contents.
+
+> “For each meat sample the data consists of a 100 channel spectrum of absorbances and the contents of moisture (water), fat and protein. The absorbance is -log10 of the transmittance measured by the spectrometer. The three contents, measured in percent, are determined by analytic chemistry.”
+
+The goal would be to be able to predict the proportion of the 3 substances using this chemistry test. To start, let's take the two data matrices (called endpoints and absorp) and bind them together in a data frame 
+
+```{r}
+library(caret)
+
+# load data
+data(tecator)
+
+# check dimensions
+dim(endpoints)
+dim(absorp)
+
+# set colnames
+colnames(endpoints) <- c("water", "fat", "protein")
+colnames(absorp) <- names0(ncol(absorp))
+
+# bind together
+tecator <- cbind(endpoints, absorp) %>%
+    as.data.frame()
+```
+
+The three outcomes have fairly high correlation. If the outcomes can be predicted using a linear model, partial least squares is an ideal method. PLS models the data as a function of a set of unobserved latent variables that are derived in a manner similar to principal component analysis. 
+
+PLS, unlike PCA, also incorporates the outcome data when creating PLS components. Like PCA it tries to maximize the variance of the predictors that are explained by the components but also tries to simultaneously maximize the correlation between those components and the outcomes. In this way, PLS chases variation of the predictors and outcomes. 
+
+Since we are working with variances and covariances, it makes sense to standardize the data. 
+
+```{r}
+recipe(water + fat + protein ~ ., data = tecator) %>%
+    step_center(everything()) %>%
+    step_scale(everything()) -> norm_rec
+```
+
+Before we can finalize the PLS model, the number of PLS components to retain must be determined. This can be done using a performance metric like the root mean squared error. We can also calculate the proportion of variance explained by the components for the predictors and each of the outcomes. 
+
+Since the dataset isn't large, resampling will be used to measure these proportions. Ten repeats of 10 fold CV will be used to build the PLS model on 90% of the data. For each of the 100 models, the proportions will be extracted and saved. 
+
+```{r}
+set.seed(8888)
+
+folds <- vfold_cv(tecator, repeats = 10)
+
+folds %<>% mutate(recipes = map(splits, prepper, recipe = norm_rec, retain = TRUE))
+
+```
+
+The complicated part here is: 
+
+1. Formatting the predictors and outcomes into the format that the pls package requires
+2. Estimating the proportions
+
+For the first part, the standardized outcomes and predictors will need to be formatted into two separate matrices. Since we used retain = TRUE when prepping the recipes, the juice function can be used. To save the data as a matrix, the option composition = "matrix" will avoid saving the data as tibbles and use the required format. 
+
+The `pls` wants to use a simple formula to specify the model but each side of the formula should represent a matrix. In other words, we need data from two columns and each column is a matrix. The secret to doing this is to protect the two matrices using `I()` when adding them to the data frame. 
+
+The calculation for the proportion of variance explained is simple for the predictors; the function `pls::expvar` will compute that. 
+
+```{r}
+library(pls)
+
+get_var_explained <- function(recipe, ...) {
+    # extract the predictors and outcomes into their own matrices
+    y_mat <- juice(recipe, composition = "matrix", all_outcomes())
+    x_mat <- juice(recipe, composition = "matrix", all_predictors())
+
+    # get into format for pls
+    pls_format <- data.frame(
+        endpoints = I(y_mat),
+        measurements = I(x_mat)
+    )
+
+    # fit the model
+    mod <- plsr(endpoints ~ measurements, data = pls_format)
+
+    # get prop of predictor variance explained by model for diff num of components
+    xve <- explvar(mod)/100
+
+    # do the same for the outcome
+    explained <- drop(pls::R2(mod, estimate = "train", intercept = FALSE)$val) %>%
+        t() %>%
+        as.data.frame() %>%
+        mutate(predictors = cumsum(xve) %>% as.vector(),
+               components = seq_along(xve)) %>%
+        # put into a tall tidy format
+        gather(source, proportion, -components)
+}
+
+# compute this data frame for each resample and save the results in different cols
+folds %<>% mutate(var = map(recipes, get_var_explained)) 
+```
+
+To extract and aggregate this data, simple row binding can be used to stack the data vertically. 
+
+```{r}
+variance_data <- bind_rows(folds[["var"]]) %>%
+    filter(components <= 15) %>%
+    group_by(components, source) %>%
+    summarize(proportion = mean(proportion))
+```
+
+The plot below shows that, if the protein measurement is important, you may require 10 or so components to achieve a good representation of that outcome. Note that the predictor variance is captured extremely well using a single component. This is due to the high degree of correlation in this data. 
+
+```{r}
+variance_data %>%
+    ggplot(aes(x = components, y = proportion, col = source)) +
+    geom_line() +
+    geom_point() +
+    theme(legend.position = "top")
+```
+
+## Text Recipes
+
+`textrecipes` contains extra steps for the `recipes` package for preprocessing text data. 
+
+```{r}
+library(textrecipes)
+```
+
+### Example 
+
+In the following example we will go through the steps needed to convert a character variable to the TF-IDF of its tokenized words after removing stop words and limiting ourself to only the 100 most used words. 
+
+```{r}
+# load data
+data(okc_text)
+
+# create recipe
+recipe(~ ., data = okc_text) %>%
+    step_tokenize(essay0, essay1) %>%
+    step_stopwords(essay0, essay1) %>%
+    step_tokenfilter(essay0, essay1, max_tokens = 100) %>%
+    step_tfidf(essay0, essay1) -> okc_rec
+
+# prep
+okc_obj <- okc_rec %>%
+    prep(training = okc_text)
+
+# look at applied recipe
+bake(okc_obj, okc_text) %>% str(list.len = 15) %>% head()
+```
+
+### Type Chart
+
+**textrecipes** includes a little departure in the design from recipes in the sense that it allows some input and output to be in the form of list columns. Here is a table of steps with their expected input and output.
+
+| Step             | Input       | Output      |
+|------------------|-------------|-------------|
+| step_tokenize    | character   | list-column |
+| step_untokenize  | list-column | character   |
+| step_stem        | list-column | list-column |
+| step_stopwords   | list-column | list-column |
+| step_tokenfilter | list-column | list-column |
+| step_tfidf       | list-column | numeric     |
+| step_tf          | list-column | numeric     |
+| step_texthash    | list-column | numeric     |
+|------------------|-------------|-------------|
+
+
+This means that the valid sequences includes 
+
+```{r}
+## recipe(~ ., data = data) %>%
+##     step_tokenize(text) %>%
+##     step_stem(text) %>%
+##     step_stopwords(text) %>%
+##     step_topwords(text) %>%
+##     step_tf(text)
+
+# or
+
+## recipe(~ ., data = data) %>%
+##     step_tokenize(text) %>%
+##     step_stem(text) %>%
+##     step_tfidf(text)
+
+```
+
+### Cookbook | Using more complex recipes involving text 
+    
+This section will show how to combine multiple steps. 
+
+
+### Counting Select Words
+
+Sometimes it is enough to know the counts of a handful of specific words. This can be achieved through the arguments `custom_stopword_source` and `keep = TRUE` in `step_stopwords`
+
+```{r}
+
+words <- c("you", "i", "sad", "happy")
+
+recipe(~ ., data = okc_text) %>%
+    step_tokenize(essay0) %>%
+    step_stopwords(essay0, custom_stopword_source = words, keep = TRUE) %>%
+    step_tf(essay0) -> okc_rec
+
+okc_obj <- okc_rec %>% prep(training = okc_text)
+
+bake(okc_obj, okc_text) %>%
+    dplyr::select(starts_with("tf_essay0")) %>%
+    head()
+
+```
+
+### Removing Words in Addition to the Stop Words List
+
+We may want to add more words to our stop words list. We can do this by applying the `step_stopwords` step twice, once for the stop words and once for our custom list. 
+
+```{r}
+words <- c("sad", "happy")
+
+recipe(~ ., data = okc_text) %>%
+    step_tokenize(essay0) %>%
+    step_stopwords(essay0) %>%
+    step_stopwords(essay0, custom_stopword_source = words) %>%
+    step_tfidf(essay0) -> okc_rec
+
+okc_obj <- okc_rec %>% prep(training = okc_text)
+
+bake(okc_obj, okc_text) %>%
+    dplyr::select(starts_with("tfidf_essay0")) %>%
+    head()
+
+```
+
+### Letter Distributions
+
+Another thing one might want to look at is the use of different letters in a certain text. For this we can use the built in character tokenizer and keep only the characters using the `step_stopwords` step. 
+
+```{r}
+recipe(~ ., data = okc_text) %>%
+    step_tokenize(essay0, token = "characters") %>%
+    step_stopwords(essay0, custom_stopword_source = letters, keep = TRUE) %>%
+    step_tf(essay0) -> okc_rec
+
+okc_obj <- okc_rec %>%
+    prep(training = okc_text)
+
+bake(okc_obj, okc_text) %>%
+    dplyr::select(starts_with("tf_essay0")) %>%
+    head()
+
+```
+
+### TF-IDF of Ngrams of Stemmed Tokens
+
+Here we would like the term frequency-inverse document frequency of the most common 500 ngrams done on stemmed tokens. 
+
+First we will tokenize according to words, then stem those words. We can then paste the stemmed tokens using `step_untokenize` so we are back at the string that we then tokenize again (this time using the ngram tokenizer). 
+
+```{r}
+
+recipe(~ ., data = okc_text) %>%
+    step_tokenize(essay0, token = "words") %>%
+    step_stem(essay0) %>%
+    step_untokenize(essay0) %>%
+    step_tokenize(essay0, token = "ngrams") %>%
+    step_tokenfilter(essay0, max_tokens = 500) %>%
+    step_tfidf(essay0) -> okc_rec
+
+okc_obj <- okc_rec %>%
+    prep(training = okc_text)
+
+
+bake(okc_obj, okc_text) %>%
+    dplyr::select(starts_with("tfidf_essay0")) %>%
+    head()
+
+```
+
+## Embed
+
+`embed` is a package that contains extra steps for the recipes package for embedding categorical predictors into one or more numeric columns. All of the processing methods are supervised. 
+
+These steps are contained in a separate package because the package dependencies (rstanarm, lm4, keras) are fairly heavy. 
+
+The steps include: 
+
+- `step_lencode_glm`, `step_lencode_bayes`, and `step_lencode_mixed` estimate the effect of each of the factor levels on the outcome and these estimates are used as the new encoding. The estimates are estimated by a generalized linear model. This step can be executed without pooling (via glm) or with partial pooling (stan_glm or lmer). 
+
+- `step_embed` uses `keras::layer_embedding` to translate the original $C$ factor levels into a set of $D$ new variables where $D < C$. The model fitting routine optimizes which factor levels are mapped to each of the new variables as well as the corresponding regression coefficients (i.e. neural network weights) that will be used as the new encodings. 
+
+Some references for entity embeddings include: 
+
+[Entity Embeddings of Categorical Variables](https://arxiv.org/abs/1604.06737)
+
+Abstract: 
+
+> We map categorical variables in a function approximation problem into Euclidean spaces, which are the entity embeddings of the categorical variables. The mapping is learned by a neural network during the standard supervised training process. Entity embedding not only reduces memory usage and speeds up neural networks compared with one-hot encoding, but more importantly by mapping similar values close to each other in the embedding space it reveals the intrinsic properties of the categorical variables. We applied it successfully in a recent Kaggle competition and were able to reach the third position with relative simple features. We further demonstrate in this paper that entity embedding helps the neural network to generalize better when the data is sparse and statistics is unknown. Thus it is especially useful for datasets with lots of high cardinality features, where other methods tend to overfit. We also demonstrate that the embeddings obtained from the trained neural network boost the performance of all tested machine learning methods considerably when used as the input features instead. As entity embedding defines a distance measure for categorical variables it can be used for visualizing categorical data and for data clustering.
+
+### Generalized Linear Models
+
+This method uses a glm to estimate the effect of each level of a factor predictor on the outcome. These values are then retained to serve as new encodings for the factor levels. This is sometimes referred to as likelihood encodings. `embed` has two estimation methods for accomplishing this: with and without pooling.
+
+The data we use will be the OkCupid data. This data is used to predict whether a person is in a STEM field. One predictor, location, is a factor variable. Rather than producing 134 indicator variables for a model, a single numeric variable can be used to represent the effect or impact of the factor level on the outcome. In this case, where a factor outcome is being predicted (stem: yes/no), the effects are quantified by the log-odds of the location for being stem. 
+
+```{r}
+# load package
+library(embed)
+
+# load data
+data(okc)
+
+# calculate log odds for the data
+okc %>%
+    group_by(location) %>%
+    summarise(
+        prop = mean(Class == "stem"),
+        log_odds = log(prop / (1 - prop)),
+        n = length(Class)
+) %>%
+    mutate(label = paste0(gsub("_", " ", location), " (n = ", n, ")")) -> props
+
+props %>% select(-label)
+
+# later, for plotting
+rng <- extendrange(props$log_odds[is.finite(props$log_odds)], f = 0.1)
+```
+
+In subsequent sections, a logistic regression model is used. When the outcome variable is numeric, the steps automatically use linear regression models to estimate effects. 
+
+### No Pooling 
+
+In this case, the effect of each location can be estimated separately for each factor level. One method for conducting this estimation step is to fit a logistic regression with the STEM classification as the outcome and the location as the predictor. From this, the log odds are naturally estimated by logistic regression. 
+
+```{r}
+# create recipe with step_lencode_glm
+recipe(Class ~ ., data = okc) %>%
+    # specify the variable being encoded and the outcome
+    step_lencode_glm(location, outcome = vars(Class)) %>%
+    # estimate the effects
+    prep(training = okc) -> okc_glm
+
+# tidy method can be used to extract the encodings and be merged w raw estimates
+glm_estimates <- tidy(okc_glm, number = 1) %>%
+    select(-terms, -id)
+
+glm_estimates %>% head()
+```
+
+For locations with `n > 1`, the estimates are effectively the same
+
+```{r}
+glm_estimates %<>%
+    set_names(c("location", "glm")) %>%
+    inner_join(props, by = "location")
+
+glm_estimates %>%
+    filter(is.finite(log_odds)) %>%
+    mutate(difference = log_odds - glm) %>%
+    select(difference) %>%
+    summary()
+```
+Note that there is also an effect that is used for a novel location for future data sets that is the average effect: 
+
+```{r}
+tidy(okc_glm, number = 1) %>%
+    filter(level == "..new") %>%
+    select(-id)
+```
+
+### Partial Pooling 
+
+This method estimates the effects by using all of the locations at once using a hierarchical Bayesian generalized linear model. The locations are treated as a random set that contributes a random intercept to the previously used logistic regression. 
+
+Partial pooling estimates each effect as a combination of the separate empirical estimates of the log odds and the prior distribution. For locations with small sample sizes, the final estimate is shrunken towards the overall mean of the log odds. This makes sense since we have poor information for estimating these locations. For locations with many data points, the estimates reply more on the empirical estimates. 
+
+#### Bayesian Methods 
+
+One approach to partial pooling is the function `step_lencode_bayes` which uses the `stan_glmer` function from the `rstanarm` package. There are a number of options that can be used to control the model estimation routine. 
+
+```{r}
+opts <- list(
+    # number of chains
+    chains = 4,
+    # num of cores to use
+    cores = parallel::detectCores(),
+    # number of iterations per chain
+    iter = 500,
+    # set the random number seed
+    seed = 8888
+)
+
+# using the default proprs, the model is estimated via
+recipe(Class ~ ., data = okc) %>%
+    step_lencode_bayes(
+        location,
+        outcome = vars(Class),
+        options = opts
+    ) %>%
+    prep(training = okc) -> okc_glmer
+
+```
+
+Now we can extract the embeddings
+
+```{r}
+all_estimates <- tidy(okc_glmer, number = 1) %>%
+    select(-terms, -id) %>%
+    set_names(c("location", "glmer")) %>%
+    inner_join(glm_estimates, by = "location")
+
+all_estimates %>% select(location, log_odds, glm, glmer)
+```
+
+Note that the `n = 1` locations have estimates that are less extreme than the naive estimates. We can also see the effect of the shrinkage induced by partial pooling by plotting the naive results vs the new results.
+
+```{r}
+
+library(ggiraph)
+
+pooled_plot <- all_estimates %>%
+    filter(is.finite(log_odds)) %>%
+    ggplot(aes(x = log_odds, y = glmer)) +
+    geom_abline(col = "blue", alpha = 0.5) +
+    geom_point_interactive(aes(size = sqrt(n), tooltip = label), alpha = 0.5) +
+    xlim(rng) + ylim(rng) +
+    theme(legend.position = "top")
+
+# convert the plot to a format that the html file can handle
+ggiraph(ggobj = pooled_plot)
+
+```
+
+New levels are encoded as 
+
+```{r}
+tidy(okc_glmer, number = 1) %>%
+    filter(level == "..new") %>%
+    select(-terms, -id) %>%
+    head()
+```
+
+#### Empirical Bayesian Methods / Mixed Models
+
+The same glm can be fit using mixed models via a random intercept. The `lme4` package can also be used to get pooled estimates via `step_lencode_mixed`. 
+
+```{r}
+recipe(Class ~ ., data = okc) %>%
+    step_lencode_mixed(
+        location,
+        outcome = vars(Class)
+) %>% prep(training = okc) -> okc_mixed
+
+all_estimates <- tidy(okc_mixed, number = 1) %>%
+    select(-terms, -id) %>%
+    set_names(c("location", "mixed")) %>%
+    inner_join(all_estimates, by = "location")
+
+all_estimates %>%
+    select(location, log_odds, glm, glmer, mixed) %>%
+    head()
+```
+
+Comparing the raw and mixed model estimates
+
+```{r}
+mixed_plot <- all_estimates %>%
+    filter(is.finite(log_odds)) %>%
+    ggplot(aes(x = log_odds, y = mixed)) +
+    geom_abline(col = "blue", alpha = 0.5) +
+    geom_point_interactive(aes(size = sqrt(n), tooltip = label), alpha = 0.5) +
+    xlim(rng) + ylim(rng) +
+    theme(legend.position = "top")
+
+ggiraph(ggobj = mixed_plot)
+```
+
+These values are very similar to the Bayesian estimates. 
+
+### Entity Embeddings of Categorical Variables using Tensorflow
+
+This approach encodes categorical data as multiple numeric variables using a word embedding approach. This was originally intended as a way to take a large number of word identifiers and represent them in a smaller dimension. 
+
+The methodology first translates the $C$ factor levels as a set of integer values then randomly allocates them to the $D$ new numeric columns. These columns are optionally connected in a neural network to an intermediate layer of hidden units. Optionally, other predictors can be added to the network in the usual way (via the predictors argument) that will also link to the hidden layer. This implementation uses a single layer with ReLu activations. Finally an output layer is used with either linear activation (for regression) or softmax (for classification). 
+
+To translate this model to a set of embeddings, the coefficients of the original embedding layer are used to represent the original factor levels. As an example, we will use the Ames housing data to predict the sales price of houses. One predictor, neighborhood, has the most factor levels of the predictors. 
+
+```{r}
+library(AmesHousing)
+
+ames <- make_ames()
+
+levels(ames$Neighborhood) %>% length()
+```
+
+The distribution of the data in the neighborhood is not uniform 
+
+```{r}
+ames %>%
+    ggplot(aes(x = Neighborhood)) +
+    geom_bar() +
+    coord_flip() +
+    xlab("")
+```
+
+For plotting later, we can calculate the simple means per neighborhood. 
+
+```{r}
+ames %>%
+    group_by(Neighborhood) %>%
+    summarise(
+        mean = mean(log10(Sale_Price)),
+        n = length(Sale_Price),
+        lon = median(Longitude),
+        lat = median(Latitude)
+) -> means
+```
+
+We'll fit a model with 10 hidden units and 3 encoding columns
+
+```{r}
+recipe(Sale_Price ~ ., data = ames) %>%
+    step_log(Sale_Price, base = 10) %>%
+    # add predictors that can be used by the network. Preprocess first
+    step_YeoJohnson(Lot_Area, Full_Bath, Gr_Liv_Area) %>%
+    step_range(Lot_Area, Full_Bath, Gr_Liv_Area) %>%
+    step_embed(
+        Neighborhood,
+        outcome = vars(Sale_Price),
+        predictors = vars(Lot_Area, Full_Bath, Gr_Liv_Area),
+        num_terms = 5,
+        hidden_units = 10,
+        options = embed_control(epochs = 75, validation_split = 0.2)
+    ) %>%
+    prep(training = ames) -> tf_embed
+```
+
+```{r}
+tf_embed$steps[[4]]$history %>%
+    filter(epochs > 1) %>%
+    ggplot(aes(x = epochs, y = loss, col = type)) +
+    geom_line() +
+    scale_y_log10()
+```
+
+We can get the embeddings via the tidy method
+
+```{r}
+hood_coef <- tidy(tf_embed, number = 4) %>%
+    select(-terms, -id) %>%
+    rename(Neighborhood = level) %>%
+    # make names smaller
+    rename_at(vars(contains("emb")), funs(gsub("Neighborhood_", "", ., fixed = TRUE)))
+
+hood_coef
+```
+
+Then, joining
+
+```{r}
+hood_coef %<>% inner_join(means, by = "Neighborhood")
+
+hood_coef
+```
+
+We can make a simple, interactive plot of the new features vs the outcome 
+
+```{r}
+tf_plot <- hood_coef %>%
+    select(-lon, -lat) %>%
+    gather(variable, value, starts_with("embed")) %>%
+    # clean up embedding names and add var as a tooltip
+    mutate(
+        label = paste0(gsub("_", " ", Neighborhood), " (n =", n, " )"),
+        variable = gsub("_", " ", variable)
+) %>%
+    ggplot(aes(x = value, y = mean)) +
+    geom_point_interactive(aes(size = sqrt(n), tooltip = label), alpha = 0.5) +
+    facet_wrap(~variable, scales = "free_x") +
+    theme(legend.position = "top") +
+    ylab("Mean (log scale)") + xlab("Embedding")
+
+ggiraph(ggobj = tf_plot)
+```
+
+However, this has induced some between predictor correlations
+
+```{r}
+hood_coef %>%
+    select(contains("emb")) %>%
+    cor() %>%
+    round(2)
+``` 
