@@ -1,0 +1,276 @@
+---
+title: "Tidy Models :: rsample <img src=\"rsample_hex.png\" style=\"float: right; width: 80px;\"/>"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE)
+```
+
+# {.tabset}
+        
+## Intro
+
+`rsample` contains a set of functions that can create different types of resamples and corresponding classes for their analysis. The goal is to have a modular set of methods for 
+
+- traditional resampling techniques for estimating the sampling distribution of a statistic
+- estimating model performance using a holdout set
+
+This is a notebook implementing the vignettes available at [tidymodels :: rsample](https://tidymodels.github.io/rsample/index.html)
+
+## Load
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+```
+
+## Basics
+
+### Terminology
+
+We define a resample as the result of a two way split of a data set. For example, when bootstrapping, one part of the resample is a sample with replacement of the original data and the other part contains the instances that were not contained in the bootstrap sample. Cross-validation is another type of resampling. 
+
+### `rset` Objects Contain Many Resamples 
+
+The main class in the package (rset) is a set or collection of resamples. In 10 fold cross validation, the set would consist of the 10 different resamples of the original data. 
+
+Here is a small set of bootstraps of the mtcars data
+
+```{r}
+# set seed for reproducibility
+set.seed(8888)
+
+(bt_resamples <- bootstraps(mtcars, times = 3))
+```
+
+### Individual Resamples are `rsplit` Objects
+
+In this package, the following terminology is used for the two partitions that comprise a sample: 
+
+- The _analysis_ data is that data that we selected in the resample. For a bootstrap, this is the sample with replacement. For 10 fold CV, this is the 90% of the data. This data is often used to fit a model or calculate a statistic in traditional bootstrapping. 
+
+- The _assessment_ data is usually the section of the original data not covered by the analysis set. Again, in 10 fold CV, this is the 10% held out. This data is often used to evaluate the performance of a model that was fit to the analysis data. 
+
+Let's take a look at one of the rsplit objects 
+
+```{r}
+(first_resample <- bt_resamples$splits[[1]])
+```
+
+This indicates that there were 32 data points in the analysis set, 14 instances in the assessment set, and that the original data contained 32 data points. To obtain either of these data sets from `rsplit`, the `as.data.frame` can be used. By default the analysis set is returned but the `data` option can be used to return the assessment data.
+
+```{r}
+as.data.frame(first_resample) %>% head()
+```
+
+alternatively, we can use the following 
+
+```{r}
+analysis(first_resample)
+
+assessment(first_resample)
+```
+
+## rsets 
+
+This page contains examples on how to use rset objects. For illustration, the `attrition` data is used. From the help file:
+
+> These data are from the IBM Watson Analytics Lab. The website describes the data with “Uncover the factors that lead to employee attrition and explore important questions such as ‘show me a breakdown of distance from home by job role and attrition’ or ‘compare average monthly income by education and attrition’. This is a fictional data set created by IBM data scientists.” There are 1470 rows.
+
+```{r}
+# load data
+data("attrition")
+
+names(attrition)
+```
+
+### Model Assessment 
+
+Let's fit a logistic regression model to the data with model terms for the job satisfaction, gender, and monthly income. 
+
+If we were fitting the model to the entire dataset, we might model attrition using 
+
+```{r}
+glm(Attrition ~ JobSatisfaction + Gender + MonthlyIncome, data = attrition, family = binomial)
+```
+
+For convenience we will create a formula object that will be used later: 
+
+```{r}
+mod_form <- as.formula(Attrition ~ JobSatisfaction + Gender + MonthlyIncome)
+```
+
+To evaluate this model we will use 10 repeats of 10fold CV and use the 100 holdout samples to evaluate the overall accuracy of the model. 
+
+```{r}
+# make splits of the data
+set.seed(8888)
+
+rs_obj <- vfold_cv(attrition, v = 10, repeats = 10)
+
+rs_obj %>% head()
+```
+
+Now let's write a function that will, for each resample: 
+
+1. Obtain the analysis data set 
+2. Fit a logistic regression model
+3. Predict the assessment data using the broom package
+4. Determine if each sample was predicted correctly 
+
+```{r}
+# splits will be the `rsplit` object with the 90/10 partition
+holdout_results <- function(splits, ...) {
+    # fit the model to the 90%
+    mod <- glm(..., data = analysis(splits), family = binomial)
+
+    # save the 10%
+    holdout <- assessment(splits)
+
+    # augment will save the predictions with the holdout data set
+    res <- augment(mod, newdata = holdout)
+
+    # class predictions on the assessment set from class probs
+    lvls <- levels(holdout$Attrition)
+    predictions <- factor(ifelse(res$.fitted > 0, lvls[2], lvls[1]), levels = lvls)
+
+    # calculate whether the prediction was correct
+    res$correct <- predictions == holdout$Attrition
+
+    # return the assessment data set with the additional columns
+    res
+}
+```
+
+For example: 
+
+```{r}
+example <- holdout_results(rs_obj$splits[[1]], mod_form)
+
+dim(example)
+
+dim(assessment(rs_obj$splits[[1]]))
+
+# example
+example[1:10, setdiff(names(example), names(attrition))]
+```
+
+For this model, the `.fitted` value is the linear predictor in log-odds units. 
+
+To compute this data set for each of the 100 resamples, we'll use the `map` function from the `purrr` package: 
+
+```{r}
+rs_obj$results <- map(rs_obj$splits, holdout_results, mod_form)
+
+rs_obj %>% head()
+```
+
+Now we can compute the accuracy values for all of the assessment data sets: 
+
+```{r}
+rs_obj$accuracy <- map_dbl(rs_obj$results, function(x) mean(x$correct))
+
+rs_obj$accuracy %>% summary() 
+```
+
+Keep in mind that the baseline accuracy to beat is the rate of non-attrition, which is 0.839. This is not a great model so far. 
+
+### Using the Bootstrap to Make Comparisons
+
+Traditionally the bootstrap has been primarily used to empirically determine the sampling distribution of a test statistic. Given a set of samples with replacement, a statistic can be calculated on each analysis set and the results can be used to make inferences (such as confidence intervals). 
+
+For example, are there differences in the median monthly income between genders? 
+
+```{r}
+attrition %>%
+    ggplot(aes(x = Gender, y = MonthlyIncome)) +
+    geom_boxplot() +
+    scale_y_log10()
+```
+
+If we wanted to compare the genders, we could conduct a t-test or rank-based test. Instead, lets use the bootstrap to see if there is a different in the median incomes for the two groups. We need a simple function to compute this statistic on the resample 
+
+```{r}
+median_diff <- function(splits) {
+    x <- analysis(splits)
+
+    median(x$MonthlyIncome[x$Gender == "Female"]) -
+        median(x$MonthlyIncome[x$Gender == "Male"])
+}
+```
+
+Now we would create a large number of bootstrap samples, say 2000+. 
+
+```{r}
+set.seed(8888)
+
+bt_resamples <- bootstraps(attrition, times = 2000)
+```
+
+This function is then computed across each resample 
+
+```{r}
+bt_resamples$wage_diff <- map_dbl(bt_resamples$splits, median_diff)
+```
+
+The bootstrap of this statistic has a slightly bimodal and skewed distribution 
+
+```{r}
+bt_resamples %>%
+    ggplot(aes(x = wage_diff)) +
+    geom_line(stat = "density", adjust = 1.25) +
+    xlab("Difference in Median Monthly Income (Female - Male)")
+```
+
+The variation is considerable in this statistic. One method of computing a confidence interval is to take the percentiles of the bootstrap distribution. A 95% confidence interval for the difference in the means would be
+
+```{r}
+quantile(bt_resamples$wage_diff, probs = c(0.025, 0.5, 0.975))
+```
+
+On average, there is no evidence for a difference in the genders. 
+
+### Bootstrap Estimates of Model Coefficients
+
+Unless there is already a column in the resample object that contains the fitted model, a function can be used to fit the model and save all of the model coefficients. the `broom` package has a tidy function that will save the coefficients in a dataframe. Instead of returning a dataframe with a row for each model term, we will save a data frame with a single row and columns for each model term. As before, map can be used to estimate and save these values for each split.
+
+```{r}
+glm_coefs <- function(splits, ...) {
+    # use analysis or as.data.frame to get the analysis data
+    mod <- glm(..., data = analysis(splits), family = binomial)
+    as.data.frame(t(coef(mod)))
+}
+
+bt_resamples$betas <- map(.x = bt_resamples$splits,
+                          .f = glm_coefs,
+                          mod_form)
+
+bt_resamples %>% head()
+
+bt_resamples$betas[[1]]
+```
+
+### Keeping Tidy
+
+As previously mentioned, `broom` contains a class called `tidy` that created representations of objects that can be easily used for analysis, plotting, etc. `rsample` contains tidy methods for rset and rsplit objects. 
+
+For example 
+
+```{r}
+first_resample <- bt_resamples$splits[[1]]
+
+first_resample %>% class()
+
+first_resample %>% tidy() %>% head()
+
+bt_resamples %>% class()
+
+bt_resamples %>% tidy() %>% head()
+```

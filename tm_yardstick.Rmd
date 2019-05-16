@@ -15,6 +15,7 @@ knitr::opts_chunk$set(warning = FALSE, message = FALSE)
 
 # {.tabset}
     
+
 ## Introduction
 
 Yardstick is a package to estimate how well models are working using tidy data principles. This file is me working through tutorials found at [tidymodels :: yardstick](https://tidymodels.github.io/yardstick/index.html). 
