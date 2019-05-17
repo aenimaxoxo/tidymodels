@@ -274,3 +274,441 @@ bt_resamples %>% class()
 
 bt_resamples %>% tidy() %>% head()
 ```
+
+## Recipes 
+
+The `recipes` package contains a data preprocessor that can be used to avoid the potentially expensive formula methods as well as providing a richer set of data manipulation tools than base R can provide. This document uses version 0.1.4 of recipes. 
+
+It is critical that any complex preprocessing steps be contained inside of resampling so that the model performance estimates take into account the variability of these steps. 
+
+### An Example Recipe
+
+For illustration, the Ames housing data will be used.
+
+```{r}
+library(AmesHousing)
+
+ames <- make_ames()
+names(ames)
+```
+
+Suppose that we wish to fit a simple regression model with the formula
+
+```
+log10(Sale_Price) ~ Neighborhood + House_Style + Year_Sold + Lot_Area
+```
+
+Let's take a look at the lot size: 
+
+```{r}
+ames %>%
+    ggplot(aes(x = Lot_Area)) +
+    geom_histogram(binwidth = 5000, col = "forestgreen", fill = "green", alpha = 0.5)
+```
+
+The distribution of the lot size is right skewed. It may benefit the model is we estimate a transformation of the data using the Box-Cox procedure. 
+
+Also, note that the frequencies of the neighborhoods can vary: 
+
+```{r}
+ames %>%
+    ggplot(aes(x = Neighborhood)) +
+    geom_bar(color = "forestgreen", fill = "green", alpha = 0.5) +
+    coord_flip() +
+    xlab("")
+```
+
+When these are resampled, some neighborhoods will not be included in the test set and this will result in a column of dummy variables with zero entries. The same is true for the House_Style variable. We may want to collapse rarely occuring variables into "other" categories. 
+
+To define the design matrix, an initial recipe is created:
+
+```{r}
+recipe(Sale_Price ~ Neighborhood + House_Style + Year_Sold + Lot_Area, data = ames) %>%
+    # log the outcome
+    step_log(Sale_Price, base = 10) %>%
+    # collapse rarely occurring jobs into other
+    step_other(Neighborhood, House_Style, threshold = 0.5) %>%
+    # dummy variables on the qualitative predictors
+    step_dummy(all_nominal()) %>%
+    # unskew a predictor
+    step_BoxCox(Lot_Area) %>%
+    # normalize
+    step_center(all_predictors()) %>%
+    step_scale(all_predictors()) -> rec 
+
+rec
+```
+
+This recreates the work that the formula method traditionally uses with the additional steps. While the original data object `ames` is used in the call, it is only used to define the variables and their characteristics so a single recipe is valid across all resampled versions of the data. The recipe can be estimated on the analysis component of the resample. 
+
+If we execute the recipe on the entire data set: 
+
+```{r}
+(rec_training_set <- prep(rec, training = ames))
+```
+
+To get the values of the data, the `bake` function can be used
+
+```{r}
+bake(rec_training_set, new_data = head(ames))
+```
+
+Note that there are fewer dummy variables for `Neighborhood` and `House_Style` than in the data. 
+
+Also, the above code using `prep` benefits from the default argument of `retain = TRUE`, which keeps the processed version of the data set so that we don't have to reapply the steps to extract the processed values. 
+
+For the data used to train the recipe, we would have used:
+
+```{r}
+juice(rec_training_set) %>% head()
+```
+
+The next section will explore recipes and bootstrap resampling for modeling:
+
+```{r}
+set.seed(8888)
+(bt_samples <- bootstraps(ames))
+
+# look at one of the splits
+bt_samples$splits[[1]]
+```
+
+The split above shows that our analysis set has 2930 samples, our assessment set have 1052 samples, and our overall data has 2930 samples.
+
+### Working with Resamples
+
+We can add our recipe in a column on a tibble. `recipes` has a convenient function called `prepper` that can be used to call `prep` but has the split objects as the first argument (for easier purrring). 
+
+```{r}
+bt_samples$recipes <- map(bt_samples$splits, prepper, recipe = rec)
+
+bt_samples
+
+bt_samples$recipes[[1]]
+```
+
+Now, to fit the model, the fit function only needs the recipe as input. This is because the above code implicitly used the `retain = TRUE` option in `prep`. Otherwise, the split objects would also be needed to `bake` the recipe.
+
+```{r}
+fit_lm <- function(rec_obj, ...) {
+    lm(..., data = juice(rec_obj, everything()))
+}
+
+bt_samples$lm_mod <- map(bt_samples$recipes, fit_lm, Sale_Price ~ .)
+
+bt_samples
+```
+
+To get predictions, the function needs 3 arguments: 
+
+- The splits (to get the assessment data)
+- The recipe (to process them)
+- The model
+
+To iterate over these, `purrr::pmap` is used
+
+```{r}
+pred_lm <- function(split_obj, rec_obj, model_obj, ...) {
+    # apply transformations to data
+    mod_data <- bake(
+        rec_obj, 
+        new_data = assessment(split_obj),
+        all_predictors(),
+        all_outcomes()
+    ) 
+
+    # separate outcome and predictors
+    out <- mod_data %>% select(Sale_Price)
+    out$predicted <- predict(model_obj, newdata = mod_data %>% select(-Sale_Price))
+
+  out
+}
+
+# add predictions to the dataframe
+bt_samples$pred <- pmap(
+    lst(split_obj = bt_samples$splits,
+        rec_obj = bt_samples$recipes,
+        model_obj = bt_samples$lm_mod),
+    pred_lm 
+)
+
+bt_samples
+```
+
+Calculating the RMSE: 
+
+```{r}
+(results <- map_dfr(bt_samples$pred, rmse, Sale_Price, predicted))
+```
+
+and the mean RMSE: 
+
+```{r}
+mean(results$.estimate)
+```
+
+## Survival Analysis
+
+In this article, a parametric analysis of censored data is conducted and `rsample` is used to measure the importance of predictors in the model. The data that will be used here is the NCCTG lung cancer data contained in the `survival` package.
+
+```{r}
+library(survival)
+
+glimpse(lung)
+```
+
+`status` is an indicator for which patients are censored (status = 1) or an actual event (status = 2). The help file `?survreg` has the following model fit: 
+
+```{r}
+lung_mod <- survreg(Surv(time, status) ~ ph.ecog + age + strata(sex), data = lung)
+
+lung_mod %>% summary() 
+```
+
+Note that the stratification on gender only affects the scale parameter; the estimates above are from a log-linear model for the scale parameter even though they are listed with the regression variables for the other parameter. 
+
+`coef` gives results that are more clear
+
+```{r}
+coef(lung_mod)
+```
+
+To resample this data, it would be a good idea to try to maintain the same censoring rate across the splits. To do this, stratified sampling can be used where each analysis / assessment split is conducted within each value of the status indicator. To demonstrate, Monte Carlo resampling is used where 75% of the data are in the analysis set. A total of 100 splits are created. 
+
+```{r}
+set.seed(8888)
+
+mc_samp <- mc_cv(lung, strata = "status", times = 100)
+
+cens_rate <- function(x) {mean(analysis(x)$status == 1)}
+
+summary(map_dbl(mc_samp$splits, cens_rate))
+```
+
+To demonstrate the use of resampling with censored data, the parametric model shown above will be fit with different variable sets to characterize how important each predictor is to the outcome. 
+
+To do this, a set of formulas are created for different variable sets: 
+
+```{r}
+three_fact <- as.formula(Surv(time, status) ~ ph.ecog + age + strata(sex))
+rm_ph.ecog <- as.formula(Surv(time, status) ~ age + strata(sex))
+rm_age <- as.formula(Surv(time, status) ~ ph.ecog + strata(sex))
+rm_sex <- as.formula(Surv(time, status) ~ ph.ecog + age)
+```
+
+The model fitting function will take the formula as an argument 
+
+```{r}
+mod_fit <- function(x, form, ...) {
+    survreg(form, data = analysis(x), ...)
+}
+```
+
+To calculate the efficacy of the model, the concordance statistic is used.
+
+```{r}
+get_concord <- function(split, mod, ...) {
+    pred_dat <- assessment(split)
+    pred_dat$pred <- predict(mod, newdata = pred_dat)
+    survConcordance(Surv(time, status) ~ pred, pred_date, ...)$concordance
+}
+```
+
+With these functions, a seris of models are created for each variable set
+
+```{r}
+mc_samp$mod_full <- map(mc_samp$splits, mod_fit, form = three_fact)
+mc_samp$mod_ph.ecog <- map(mc_samp$splits, mod_fit, form = rm_ph.ecog)
+mc_samp$mod_age <- map(mc_samp$splits, mod_fit, form = rm_age)
+mc_samp$mod_sex <- map(mc_samp$splits, mod_fit, form = rm_sex)
+```
+
+Similarly, the concordance values are computed for each model
+
+```{r}
+mc_samp$full <- map2_dbl(mc_samp$splits, mc_samp$mod_full, get_concord)
+mc_samp$ph.ecog <- map2_dbl(mc_samp$splits, mc_samp$mod_ph.ecog, get_concord)
+mc_samp$age <- map2_dbl(mc_samp$splits, mc_samp$mod_age, get_concord)
+mc_samp$sex <- map2_dbl(mc_samp$splits, mc_samp$mod_sex, get_concord)
+```
+
+The distributions of the resampling estimates
+
+```{r}
+concord_est <- mc_samp %>%
+  select(-matches("^mod"))
+
+concord_est %>%
+  select(-splits) %>%
+  gather() %>%
+  filter(key != "id") %>%
+  group_by(key) %>% 
+  ggplot(aes(x = value, group = key, col = key)) + 
+  geom_line(stat = "density") + 
+  theme(legend.position = "top")
+```
+
+
+
+## Time Series
+
+This article uses the analysis from [business-science.io :: Demo Week: Tidy Forecasting with sweep](http://www.business-science.io/code-tools/2017/10/25/demo_week_sweep.html) with rsample to get performance estimates for future observations using rolling forecast origin resampling. 
+
+The data is sales of alcoholic beverages and is is originally from the [Federal Reserve Bank of St. Louis' Website](https://fred.stlouisfed.org/series/S4248SM144NCEN). 
+
+
+```{r}
+# load data
+data("drinks")
+
+str(drinks, give.attr = FALSE)
+```
+
+Each row is amonth of sales (in millions of USD). 
+
+Suppose that the predictions for one year ahead were needed and the model should use the most recent data from the last 20 years. To setup this resampling scheme: 
+
+```{r}
+roll_rs <- rolling_origin(
+    drinks,
+    initial = 12 * 20,
+    assess = 12,
+    cumulative = FALSE
+)
+
+nrow(roll_rs)
+
+roll_rs %>% head()
+```
+
+Each `split` element contains the information about that resample. 
+
+```{r}
+roll_rs$splits[[1]]
+```
+
+For plotting, let's index each split by the first day of the assessment set: 
+
+```{r}
+get_date <- function(x) {
+    assessment(x)$date %>% min() 
+}
+
+start_date <- map(roll_rs$splits, get_date)
+
+roll_rs$start_date <- do.call("c", start_date)
+
+roll_rs$start_date %>% head() 
+```
+
+This resampling scheme has 58 splits of the data so that there will be 58 ARIMA models that are fit. To create the models, the `auto.arima` function from the `forecast` package is used. The functions `analysis` and `assessment` return the data frame, so another step converts the data into a `ts` object called `mod_dat` using a function in the `timetk` package
+
+```{r}
+library(forecast) # for auto.arima
+library(timetk)   # for tk_ts
+library(zoo)      # for as.yearmon
+
+fit_model <- function(x, ...) {
+    x %>%
+        analysis() %>%
+        # since the first day changes over resamples, adjust based on first date
+        tk_ts(start = .$date[[1]] %>% as.yearmon(),
+              freq = 12,
+              silent = TRUE) %>%
+        auto.arima(...)
+}
+```
+
+Each model is saved in a new column
+
+```{r}
+roll_rs$arima <- map(roll_rs$splits, fit_model)
+
+# for example
+roll_rs$arima[[1]]
+```
+
+Using the model fits, performance will be measured in two ways: 
+
+- _interpolation error_ will measure how well the model fits to the data that we used to create the model. This is most likely optimistic since no holdout method is used. 
+
+- _extrapolation error_ or forecast error evaluates the efficacy of the model on the data from the following year (that were not used in the model fit).
+
+In each case, the mean absolute percent error (MAPE) is the statistic used to characterize the model fits. The interpolation error can be computed from the `Arima` object. To make things each, the `sweep` package's `sw_glance` function is used
+
+```{r}
+library(sweep)
+
+roll_rs$interpolation <- map_dbl(
+    roll_rs$arima,
+    function(x) {
+        sw_glance(x)[["MAPE"]]
+    }
+)
+
+summary(roll_rs$interpolation)
+```
+
+For the extrapolation error, the model and split objects are required. Using these: 
+
+```{r}
+get_extrap <- function(split, mod) {
+    n <- nrow(assessment(split))
+
+    # get assessment data
+    pred_dat <- assessment(split) %>%
+        mutate(
+            pred = as.vector(forecast(mod, h = n)$mean),
+            pct_error = (S4248SM144NCEN - pred) / S4248SM144NCEN * 100
+        )
+    mean(abs(pred_dat$pct_error))
+}
+
+roll_rs$extrapolation <- map2_dbl(roll_rs$splits, roll_rs$arima, get_extrap)
+
+roll_rs$extrapolation %>% summary()
+```
+
+What do these error estimates look like over time? 
+
+```{r}
+roll_rs %>%
+    select(interpolation, extrapolation, start_date) %>%
+    as.data.frame %>%
+    gather(error, MAPE, -start_date) %>%
+    ggplot(aes(x = start_date, y = MAPE, col = error)) +
+    geom_point() +
+    geom_line() +
+    theme(legend.position = "top") +
+    ylim(c(0, 6))
+```
+
+It is likely that the interpolation error is an underestimate to some degree. 
+
+It is also worth noting that `rolling_origin` can be used over calendar periods, rather than just over a fixed window size. This is especially useful for irregular series where a fixed window size might not make sense because of  missing data points, or because of calendar features like different months having a different number of days. 
+
+The example below demonstrates this idea by splitting drinks into a nested set of 26 years, and rolling over years rather than months. Note that the end result accomplished a different task than the original example, in this case, each slice moves forward an entire year rather than just one month. 
+
+```{r}
+# nest period to roll over, in this case a year
+roll_rs_annual <- drinks %>%
+    mutate(year = as.POSIXlt(date)$year + 1900) %>%
+    nest(-year) %>%
+    rolling_origin(
+        initial = 20,
+        assess = 1,
+        cumulative = FALSE
+    )
+
+analysis(roll_rs_annual$splits[[1]])
+```
+
+The workflow to access these calendar slices is to use `bind_rows()` to join each analysis set together. 
+
+```{r}
+roll_rs_annual %>%
+    mutate(
+        extracted_slice = map(splits, ~ bind_rows(analysis(.x)$data))
+    )
+```
+
