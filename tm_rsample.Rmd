@@ -29,6 +29,7 @@ This is a notebook implementing the vignettes available at [tidymodels :: rsampl
 ```{r}
 library(tidyverse)
 library(tidymodels)
+library(magrittr)
 ```
 
 ## Basics
@@ -510,7 +511,7 @@ To calculate the efficacy of the model, the concordance statistic is used.
 get_concord <- function(split, mod, ...) {
     pred_dat <- assessment(split)
     pred_dat$pred <- predict(mod, newdata = pred_dat)
-    survConcordance(Surv(time, status) ~ pred, pred_date, ...)$concordance
+    survConcordance(Surv(time, status) ~ pred, pred_dat, ...)$concordance
 }
 ```
 
@@ -545,12 +546,56 @@ concord_est %>%
   group_by(key) %>% 
   ggplot(aes(x = value, group = key, col = key)) + 
   geom_line(stat = "density") + 
-  theme(legend.position = "top")
+  theme(legend.position = "top", axis.text.x = element_blank())
 ```
 
+It looks as though the model missing `ph.ecog` has a larger concordance value than the other models. To more formally test this, the `tidyposterior` package is used to create a Bayesian model for the concordance statistics.
 
+```{r}
+library(tidyposterior)
+
+concord_est <- perf_mod(concord_est, seed = 8888, iter = 5000)
+```
+
+```{r}
+concord_est$stan
+```
+
+To summarize the posteriors for each model: 
+
+```{r}
+concord_est %>%
+    tidy() %>%
+    ggplot()
+```
+
+While this seems clear cut, let us assume that a difference in the concordance statistic of 0.1 is a real effect. To compute the posteriors for the difference in models, the full model will be contrasted with the others:
+
+```{r}
+# contrast comparisons
+comparisons <- contrast_models(
+    concord_est,
+    list_1 = rep("full", 3),
+    list_2 = c("ph.ecog", "age", "sex"),
+    seed = 8888
+)
+
+# plot
+comparisons %>%
+    ggplot(size = 0.05)
+```
+
+The posterior distributions show that, statistically, `ph.ecog` has real importance in the model. However, since these distributions are mostly within +- 0.05, they are unlikely to be real differences. 
+
+The ROPE statistics quantify the practical effects: 
+
+```{r}
+summary(comparisons, size = 0.05) %>%
+    select(contrast, starts_with("pract"))
+```
 
 ## Time Series
+
 
 This article uses the analysis from [business-science.io :: Demo Week: Tidy Forecasting with sweep](http://www.business-science.io/code-tools/2017/10/25/demo_week_sweep.html) with rsample to get performance estimates for future observations using rolling forecast origin resampling. 
 
@@ -712,3 +757,360 @@ roll_rs_annual %>%
     )
 ```
 
+## Nested Resampling 
+
+Normally we split into an initial split into a training and test set. If resampling is used, we execute it on the training set. 
+
+<center>
+![](resampling.png)
+</center>
+
+A common method for tuning models is grid search where a candidate set of tuning parameters is created. The potential problem is, once we pick the tuning parameter associated with the best performance, this is usually quoted as the performance of the model. There is serious potential for _optimization bias_ since we used the same data to tune the model and quote performance. This results in an optimistic estimate of the performance. 
+
+Nested resampling performs an additional later of resampling that separates the tuning activities from the process used to estimate the efficacy of the model. An outer resampling scheme is used, and, for every split in the outer resample, another full set of resampling splits are created on the original analysis set. For example, if we use 10 fold CV on the outside, and 5 fold CV on the inside, a total of 500 models will be fit. The parameter tuning will be conducted 10 times and the best parameters are determined from the average of the 5 assessment sets. This process occurs 10 times. 
+
+Once the tuning results are complete, a model is fit to each of the outer resampling splits using the best parameter associated with that resample. The average of the outer method's assessment sets are an unbiased estimate of the model. 
+
+We can simulate some regression data to illustrate the methods. A training set size of 100 data ponts are generated as well as a large set that will be used to characterize how well the resampling procedure performed. 
+
+```{r}
+library(mlbench)
+
+sim_data <- function(n) {
+    tmp <- mlbench.friedman1(n, sd = 1)
+    tmp <- cbind(tmp$x, tmp$y)
+    tmp <- as.data.frame(tmp)
+    names(tmp)[ncol(tmp)] <- "y"
+    tmp
+}
+
+set.seed(8888)
+train_dat <- sim_data(100)
+large_dat <- sim_data(10^5)
+```
+
+First, we must specify the types of resampling methods. We will choose 5 repeats of 10fold CV for the outer resampling method to generate the estimate of overall performance. To tune the model, it would be good to have precise estimates for each of the values of the tuning parameter so 25 iterations of the bootstrap will be used. Thus, there will be 5 * 10 * 25 = 1250 models that are fit to the data per tuning parameter. These will be discarded once the performance of the model has been quantified. 
+
+```{r}
+# create the tibble with resampling specifications
+results <- nested_cv(train_dat,
+                     outside = vfold_cv(repeats = 5),
+                     inside = bootstraps(times = 25))
+
+results
+```
+
+The splitting information for each resample is contained in the split objects. Focusing on the second fold for the first repeat: 
+
+```{r}
+results$splits[[2]]
+```
+
+This indicates the number of data in the analysis set / assessment set / original data. 
+
+Each element of `inner_resamples` has its own tibble with the bootstrapping splits
+
+```{r}
+results$inner_resamples[[5]]
+```
+
+These are self contained, meaning that the bootstrap sample is aware that it is a sample of a specific 90% of the data
+
+```{r}
+results$inner_resamples[[5]]$splits[[1]]
+```
+
+To start, we must define how the model will be created and measured. After the model is fit to the analysis set, the RMSE is computed on the assessment set. 
+
+```{r}
+# our function to fit the radial basis SVM
+library(kernlab)
+
+# object will be an rsplit obj from our results table, cost is the tuning param
+svm_rmse <- function(object, cost = 1) {
+    y_col <- ncol(object$data)
+    mod <- ksvm(y ~ ., data = analysis(object), C = cost)
+    holdout_pred <- predict(mod, assessment(object)[-y_col])
+    rmse <- sqrt(mean((assessment(object)$y - holdout_pred) ^ 2, na.rm = TRUE))
+    rmse
+}
+
+# in some cases, we want to parameterize the fn over the tuning params
+rmse_wrapper <- function(cost, object) svm_rmse(object, cost)
+```
+
+For the nested resampling, a model needs to be fit for each tuning parameter and each bootstrap split. To do this, a wrapper can be created: 
+
+```{r}
+# object will be an rsplit object for the bootstrap samples
+tune_over_cost <- function(object) {
+    results <- tibble(cost = 2 ^ seq(-2, 8, by = 1))
+    results$RMSE <- map_dbl(results$cost, rmse_wrapper, object = object)
+    results
+}
+```
+
+Since this will be called across the set of outer CV splits, another wrapper is required
+
+```{r}
+# object is an rsplit obj in results$inner_resamples
+summarize_tune_results <- function(object) {
+    # return rowbound tibble with 25 positive bootstrap results
+    map_df(object$splits, tune_over_cost) %>%
+        group_by(cost) %>%
+        summarize(mean_RMSE = mean(RMSE, na.rm = TRUE), n = length(RMSE))
+}
+```
+
+Now that those functions are defined, we can execute all the inner resampling loops: 
+
+```{r}
+tuning_results <- map(results$inner_resamples, summarize_tune_results)
+```
+
+`tuning_results` is a list of data frames for each of the 50 outer resamples. We can make a plot of the averaged results to see what the relationship is between the RMSE and the tuning parameters for each of the inner bootstrapping operations:
+
+```{r}
+library(scales)
+
+pooled_inner <- tuning_results %>% bind_rows
+
+best_cost <- function(dat) dat[which.min(dat$mean_RMSE),]
+
+p <- ggplot(pooled_inner, aes(x = cost, y = mean_RMSE)) +
+    scale_x_continuous(trans = 'log2') +
+    xlab("SVM Cost") + ylab("Inner RMSE")
+
+for (i in 1:length(tuning_results)) {
+    p <- p +
+        geom_line(data = tuning_results[[i]], alpha = .2) +
+        geom_point(data = best_cost(tuning_results[[i]]), pch = 16)
+}
+
+p %<>% + geom_smooth(data = pooled_inner, se = FALSE) 
+
+p
+```
+
+Each grey line is a separate bootstrap resampling curve created from a different 90% of the data. The blue line is a loess smooth of all the results pooled together. 
+
+To determine the best parameter estimate for each of the outer resampling iterations: 
+
+```{r}
+cost_vals <- tuning_results %>%
+    map_df(best_cost) %>%
+    select(cost)
+
+results <- bind_cols(results, cost_vals)
+
+results$cost <- factor(results$cost, levels = paste(2 ^ seq(-2, 8, by = 1)))
+
+results %>%
+    ggplot(aes(x = cost)) +
+    geom_bar() +
+    xlab("SVM Cost") +
+    scale_x_discrete(drop = FALSE)
+```
+
+Most of the resamples produced an optimal cost value of 2.0, but the distribution is right skewed due to the flat trend in the resampling profile once the cost value becomes 10 or larger. 
+
+Now that we have these estimates, we can compute the outer resampling results for each of the 50 splits using the corresponding tuning parameter values
+
+```{r}
+results$RMSE <- map2_dbl(results$splits, results$cost, svm_rmse)
+summary(results$RMSE)
+```
+
+The estimated RMSE for the model tuning process is 2.518. 
+
+What is the RMSE for the non-nested procedure when only the outer resampling method is used? For each cost value in the tuning grid, 50 SVM models are fit and their RMSE values are averaged. The table of cost values and mean RMSE estimates is used to determine the best cost value. The associated RMSE is the biased estimate. 
+
+```{r}
+not_nested <- map(results$splits, tune_over_cost) %>%
+    bind_rows
+
+outer_summary <- not_nested %>%
+    group_by(cost) %>%
+    summarize(outer_RMSE = mean(RMSE), n = length(RMSE))
+
+outer_summary %>%
+    ggplot(aes(x = cost, y = outer_RMSE)) +
+    geom_point() +
+    geom_line() +
+    scale_x_continuous(trans = 'log2') +
+    xlab("SVM Cost") + ylab("RMSE")
+```
+
+The non-nested procedure estimates the RMSE to be 2.61. Both estimates are fairly close. 
+
+The approximately true RMSE for an SVM model with a cost value of 2.0 can be approximated with the large sample that was simulated at the beginning. 
+
+```{r}
+finalModel <- ksvm(y ~ ., data = train_dat, C = 2)
+
+large_pred <- predict(finalModel, large_dat[, -ncol(large_dat)])
+
+sqrt(mean((large_dat$y - large_pred) ^ 2, na.rm = TRUE))
+```
+
+The nested procedure produces a closer estimate to the approximate truth but the non-nested estimate is very similar. 
+
+## Grid Search w Keras
+
+Here we demonstrate a grid search to optimize a tuning parameter of a `keras` neural network. 
+
+```{r}
+library(AmesHousing)
+
+ames <- make_ames() %>%
+    select(Sale_Price, Longitude, Latitude)
+```
+
+To be consistent, a training / test split is made. This article focused on the training set. 
+
+Normally, feature engineering should be estimated within the resampling process to get generalizable estimates of performance. Here, the two predictors are simply centered and scaled to avoid complexity. This is generally a bad idea and the article on `recipes` describes a proper methodology for preprocessing the data. 
+
+```{r}
+set.seed(8888)
+
+data_split <- initial_split(ames, strata = "Sale_Price")
+
+ames_train <- training(data_split) %>%
+    mutate(Sale_Price = log10(Sale_Price),
+           Longitude = scale(Longitude, center = TRUE),
+           Latitude = scale(Latitude, center = TRUE))
+```
+
+The resample on the model, simple 10 fold CV, is done such that the splits use the outcome as a stratification variable. On average, there should be 219 properties in the assessment set and this should be enough to obtain good estimates of the model RMSE. 
+
+```{r}
+set.seed(8888)
+cv_splits <- vfold_cv(ames_train, v = 10, strata = "Sale_Price")
+```
+
+A single layer feed forward neural network with 10 hidden units will be used to model this data. There are many tuning parameters for these models including for structural aspects (number of hidden units, activation type, number of layers), the optimization (momentum, dropout rate, etc), and so on. For simplicity, this article will only optimize the number of training epochs; basically this is a test for early stopping. 
+
+The function below constructs the model, predicts the assessment set, and computes the holdout root mean squared error in log10 units. The function constructs the model sequentially and takes the number of epochs as a parameter. In this function, the seed is set; initializer_glorot_uniform and layer_dropout use random numbers and their specific seeds are set from the session's seed. 
+
+```{r}
+library(keras)
+
+mlp_rmse <- function(epoch, split, ...) {
+  # Set the seed to get reproducible starting values and dropouts
+  set.seed(4109)
+  
+  # Clearing the session after the computations have finished
+  # clears memory used by the last trial in preparation for 
+  # the next iteration. 
+  on.exit(keras::backend()$clear_session())
+  
+  # Define a single layer MLP with dropout and ReLUs
+  model <- keras_model_sequential()
+  model %>% 
+    layer_dense(
+      units = 10, 
+      activation = 'relu', 
+      input_shape = 2,
+      kernel_initializer = initializer_glorot_uniform()
+    ) %>% 
+    layer_dropout(rate = 0.4) %>% 
+    layer_dense(units = 1, activation = "linear")
+
+  model %>% compile(
+    loss = 'mean_squared_error',
+    optimizer = optimizer_rmsprop(),
+    metrics = 'mean_squared_error'
+  )
+  
+  # The data used for modeling (aka the "analysis" set)
+  geocode <- 
+    analysis(split) %>%
+    select(-Sale_Price) %>%
+    as.matrix()
+  
+  model %>% fit(
+    x = geocode, 
+    y = analysis(split)[["Sale_Price"]], 
+    epochs = epoch,
+    ...
+    )
+  
+  # Now obtain the holdout set for prediction
+  holdout <- assessment(split)
+  pred_geocode <- 
+    holdout %>%
+    select(-Sale_Price) %>%
+    as.matrix()
+  
+  # Get predicted values and compute RMSE
+  holdout %>%
+    mutate(predicted = predict(model, pred_geocode)[,1]) %>% 
+    rmse(truth = Sale_Price, estimate = predicted) %>%
+    pull(.estimate)
+}
+
+```
+
+Let's execute the function on the first fold of the data using a batch size of 28 and disable the print / plotting of the optimization: 
+
+```{r}
+cv_splits$splits[[1]]
+
+mlp_rmse(
+    epoch = 100,
+    cv_splits$splits[[1]],
+    batch_size = 128,
+    verbose = 0
+)
+```
+
+This works for a single resample and epoch setting. To tune over epochs, another function uses map to work over the tuning parameter for a specific resample. 
+
+```{r}
+across_grid <- function(split, ...) {
+    # create grid
+    epoch_values <- tibble(epoch = seq(50, 600, by = 50))
+
+    # execute grid for this resample
+    epoch_values$rmse <- map_dbl(
+        epoch_values$epoch,
+        mlp_rmse,
+        split = split,
+        ...
+    )
+
+    cbind(epoch_values, labels(split))
+}
+```
+
+Note that the grid could have easily been multidimensional such that many parameters could be optimized using a regular grid or via random search. 
+
+```{r}
+tune_results <- map_df(
+    cv_splits$splits,
+    across_grid,
+    batch_size = 128,
+    verbose = 0
+)
+
+tune_results %>% head()
+```
+
+The mean RMSE per epoch is computed and plotted along with the individual curves for each resample. 
+
+```{r}
+mean_values <- tune_results %>%
+    group_by(epoch) %>%
+    summarize(rmse = mean(rmse))
+
+mean_values
+```
+
+```{r}
+mean_values %>%
+    ggplot(aes(x = epoch, y = rmse)) +
+    geom_point() +
+    geom_line() +
+    geom_line(data = tune_results, aes(group = id), alpha = 0.1) +
+    scale_y_continuous(trans = 'log2')
+```
