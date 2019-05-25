@@ -1,0 +1,232 @@
+---
+title: "Tidy Models :: dials"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%")
+```
+
+# {.tabset}
+
+## Overview
+
+This package contains tools to create and manage values of tuning parameters and is designed to integrate well with the parsnip package. 
+
+### Load
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+```
+
+## Basic
+
+Some statistical and machine learning models contain tuning parameters (hyperparameters), which are parameters that cannot be directly estimated by the model. To determine reasonable values of these elements, some indirect method is used such as resampling or profile likelihood. Search methods, such as genetic algorithms or Bayesian search can also be used to determine good values. 
+
+Some information is needed to create a grid or to validate whether a candidate value is appropriate. `dials` is designed to: 
+
+- create a framework for describing and querying tuning parameters. This can include getting sequences or random tuning values, validating current values, transforming parameters, and other tasks. 
+
+- standardize the names of different parameters. 
+
+- Work with the parsnip package, which is a standardized interface for R models.
+
+- adhere to tidy principles
+
+#### param Objects
+
+`param` objects contain information about possible values, ranges, types, and other aspects. `quant_param` is the subclass for double and integer valued data, and logical and character data use the subclass `qual_param`. 
+
+#### Numeric Parameters
+
+An example of a numeric tuning parameter is the cost-complexity parameter of CART trees, otherwise known as $C_p$. The parameter object in dials is 
+
+```{r}
+Cp
+```
+
+Note that this parameter is handled in log units and the default range of values is between $10^{-10}$ and 0.1. The range of possible values can be returned and changed based on some utility functions. 
+
+```{r}
+# get range
+Cp %>% range_get()
+
+# set range
+Cp %>% range_set(c(-5, 1))
+```
+
+Values for this parameter can be obtained in a few different ways. To get a sequence of values that span the range: 
+
+```{r}
+# natural units
+Cp %>% value_seq(n = 4)
+
+# stay in the transformed space 
+Cp %>% value_seq(n = 4, original = FALSE)
+```
+
+Random values can be sampled too. A random uniform distribution is used. Since this parameter has a transformation associated with it, the values are simulated in the transformed scale and then returned in natural units. 
+
+```{r}
+set.seed(8888)
+
+Cp %>% value_sample(n = 4)
+```
+
+For CART trees, there is a discrete set of values that exist for a given data set. It may be a good idea to assign these possible values to the object. We can get them by fitting an initial `rpart` model and then adding the values to the object. 
+
+```{r}
+library(rpart)
+library(magrittr)
+
+cart_mod <- rpart(mpg ~ ., data = mtcars, control = rpart.control(cp = 0.000001))
+
+cart_mod$cptable
+
+cp_vals <- cart_mod$cptable[, "CP"]
+
+# we should only keep values associated with at least one split
+cp_vals <- cp_vals[cart_mod$cptable[, "nsplit"] > 0]
+
+# here are the specific Cp values, on their natural scale, added
+(mtcars_cp <- Cp %>% value_set(cp_vals %>% log10()))
+```
+
+Now if a sequence or random sample is requested, it uses the set values: 
+
+```{r}
+mtcars_cp %>% value_seq(2)
+
+# sampling specific values is done with replacement
+mtcars_cp %>%
+    value_sample(20) %>%
+    table()
+```
+
+### Discrete Parameters
+
+In this case, there is no notion of a range or scale. The parameter objects are defined by their values. 
+
+Consider a parameter for the types of kernel functions that are used with distance functions
+
+```{r}
+weight_func
+```
+
+The helper functions are analogues to the quantitative parameters: 
+
+```{r}
+# redefine values
+weight_func %>% value_set(c("rectangular", "triangular"))
+
+# distance weighting function (qualitative)
+weight_func %>% value_sample(3)
+
+# the sequence is returned in the order of the levels
+weight_func %>% value_seq(3)
+```
+
+#### Unknown Values
+
+There are some cases where the range of parameter values are data dependent. For example, the upper bound on the number of neighbors cannot be known if the number of data points in the training set is not known. For that reason, some parameters have an unknown placeholder: 
+
+```{r}
+mtry
+
+neighbors
+
+min_n
+
+sample_size
+
+num_terms
+
+num_comp
+```
+
+These values must be initialized prior to generating parameter values. 
+
+#### Parameter Grids
+
+Sets or combinations or parameters can be created for use in grid search. `grid_regular` and `grid_random` take any number of param objects.
+
+For example, for a glmnet model, a regular grid might be: 
+
+```{r}
+grid_regular(
+    mixture,
+    levels = 3
+)
+
+grid_random(
+    mixture,
+    size = 6
+)
+```
+
+## parsnip
+
+`parsnip` is a package in development that provides more unified interfaces to model functions. It has functions to create a model specification that can be used to fit a particular model using different R packages. 
+
+For example, a minimal model specification is:
+
+```{r}
+boost_tree(mode = "classification")
+```
+
+This particular model has a number of different arguments for tuning parameters. 
+
+```{r}
+str(boost_tree)
+```
+
+If we know exactly what specific value of a parameter should be, it can be specified: 
+
+```{r}
+boost_tree(mode = "classification", trees = 50, min_n = 5, sample_size = 3/4)
+```
+
+Note that: 
+
+- These parameter names have identically named parameter objects in dials
+
+- Like other parsnip functions, boost_tree can use different R packages to fit this model. 
+
+- Any parameters not specified in this call will use their model specific defaults
+
+What happens if we want to optimize the value of a parameter but don't know what the value will be? The parsnip function `varying()` can be used as a placeholder. For example, `min_n` is conditional on the sample size of the training set, so we may not know a feasible value until we have the exact training or analysis set. 
+
+```{r}
+(mod_obj <- boost_tree(mode = "classification", trees = 50, min_n = varying(), sample_size = 3/4))
+```
+
+If some type of grid search is used, there is a simple function in dials that can be used to update this parameter specification with candidate values. 
+
+Let's create a small, random grid for these parameters. We will set the ranges for these parameters inline when creating the grid. 
+
+```{r}
+set.seed(8888)
+
+(bst_grid <- grid_random(
+    trees %>% range_set(c(1, 50)),
+    min_n %>% range_set(c(2, 30)),
+    sample_size %>% range_set(c(20, 130)),
+    size = 3
+))
+```
+
+We can use the `merge` function to combine these parameters with the model specification: 
+
+```{r}
+for (i in 1:nrow(bst_grid)) {
+    print(merge(mod_obj, bst_grid[i, ]))
+}
+```
+

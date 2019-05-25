@@ -1,0 +1,305 @@
+---
+title: "Tidy Models :: infer <img src=\"infer_gnome.png\" style=\"float: right; width: 80px;\"/>"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%")
+```
+
+# {.tabset}
+        
+## Index
+
+![](ht_infer.png)
+
+### Load 
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(patchwork)
+library(magrittr)
+```
+
+### Examples
+
+```{r}
+# convert ordinal to factors
+mtcars %<>% as.data.frame() %>%
+    mutate(
+        cyl = factor(cyl),
+        vs = factor(vs),
+        am = factor(am),
+        gear = factor(gear),
+        carb = factor(carb)
+    )
+```
+
+Now we can perform a hypothesis test for a difference in proportions (using the formula interface `y ~ x` in `specify()`)
+
+```{r}
+mtcars %>%
+    specify(am ~ vs, success = "1") %>%
+    hypothesize(null = "independence") %>%
+    generate(reps = 100, type = "permute") %>%
+    calculate(stat = "diff in props", order = c("1", "0")) %>%
+    head()
+```
+
+Confidence interval for a difference in means (using the non-formula interface giving both the response and explanatory variables in specify())
+
+```{r}
+mtcars %>%
+    specify(response = mpg, explanatory = am) %>%
+    generate(reps = 100, type = "bootstrap") %>%
+    calculate(stat = "diff in means", order = c("1", "0")) %>%
+    head()
+```
+
+Note that the formula and non-formula interfaces work for all implemented inference procedures in `infer`. Use whatever is more natural. If we will be doing modeling with functions like `lm()` and `glm()`, we should use the `y ~ x` notation. 
+
+## Chi Sq
+
+```{r}
+library(nycflights13)
+
+set.seed(8888)
+
+flights %>%
+    na.omit() %>%
+    sample_n(size = 500) %>%
+    mutate(season = case_when(
+               month %in% c(10:12, 1:3) ~ "winter",
+               month %in% c(4:9) ~ "summer"
+           ),
+           day_hour = case_when(
+               between(hour, 1, 12) ~ "morning",
+               between(hour, 13, 24) ~ "not morning"
+           )) %>%
+    select(arr_delay, dep_delay, season, day_hour, origin, carrier) -> fli_small
+
+fli_small %>% head()
+```
+
+Now we have: 
+
+- two numeric : arr_delay and dep_delay 
+
+- two categories : season and day_hour 
+
+- three categories for origin (EWR, JFK, LGA)
+
+- sixteen categories for carrier
+
+### One Numeric, One Categorical (2 Levels)
+
+#### Calculate Observed Statistic
+
+```{r}
+obs_chisq <- fli_small %>%
+    specify(origin ~ season) %>%
+    calculate(stat = "Chisq")
+
+# alternatively
+fli_small %>%
+    chisq_test(formula = origin ~ season) %>%
+    select(statistic)
+
+# alternatively
+fli_small %>%
+    chisq_stat(formula = origin ~ season)
+```
+
+Our chi sq statistic is 1.05. 
+
+#### Randomization Approach to ChiSq Statistic
+
+```{r}
+fli_small %>%
+    specify(origin ~ season) %>%
+    hypothesize(null = "independence") %>%
+    generate(reps = 1000, type = "permute") %>%
+    calculate(stat = "Chisq") -> chisq_null_perm
+
+visualize(chisq_null_perm) +
+    shade_p_value(obs_chisq, direction = "greater")
+```
+
+#### Calculate the Randomization-Based p-value
+
+```{r}
+chisq_null_perm %>%
+    get_p_value(obs_chisq, direction = "greater")
+```
+
+#### Theoretical Distribution
+
+```{r}
+fli_small %>%
+    specify(origin ~ season) %>%
+    hypothesize(null = "independence") %>%
+    # generate not used for theoretical
+    calculate(stat = "Chisq") -> chisq_null_theory
+
+visualize(chisq_null_theory, method = "theoretical") +
+    shade_p_value(obs_stat = obs_chisq, direction = "right")
+```
+
+#### Overlay Appropriate Chisq distribution on Top of Permuted Statistics
+
+```{r}
+visualize(chisq_null_perm, method = "both") +
+    shade_p_value(obs_stat = obs_chisq, direction = "right")
+```
+
+#### Compute Theoretical P-value 
+
+```{r}
+fli_small %>%
+    chisq_test(formula = origin ~ season) %>%
+    pull(p_value)
+```
+
+## t test
+
+#### Data Prep
+
+```{r}
+set.seed(8888)
+
+fli_small <- flights %>%
+    sample_n(size = 500) %>%
+    mutate(half_year = case_when(
+               between(month, 1, 6) ~ "h1",
+               between(month, 7, 12) ~ "h2"
+           ),
+           day_hour = case_when(
+               between(hour, 1, 12) ~ "morning",
+               between(hour, 13, 24) ~ "not morning"
+           )) %>%
+    select(arr_delay, dep_delay, half_year, day_hour, origin, carrier)
+```
+
+#### One Numerical, One Categorical
+
+##### Calculate Observed Statistic
+
+```{r}
+obs_t <- fli_small %>%
+    specify(arr_delay ~ half_year) %>%
+    calculate(stat = "t", order = c("h1", "h2"))
+
+# alternatively
+obs_t <- fli_small %>%
+    t_test(formula = arr_delay ~ half_year, alternative = "two_sided",
+           order = c("h1", "h2")) %>%
+    pull(statistic)
+
+# or
+obs_t <- fli_small %>%
+    t_stat(formula = arr_delay ~ half_year, order = c("h1", "h2"))
+```
+
+The observed t-statistic is `r obs_t`. 
+
+#### Randomization Approach to t-statistic
+
+```{r}
+t_null_perm <- fli_small %>%
+    specify(arr_delay ~ half_year) %>%
+    hypothesize(null = "independence") %>%
+    generate(reps = 1000, type = "permute") %>%
+    calculate(stat = "t", order = c("h1", "h2"))
+
+visualize(t_null_perm) +
+    shade_p_value(obs_stat = obs_t, direction = "two_sided")
+```
+
+#### Calculate the Randomization based p-value 
+
+```{r}
+t_null_perm %>%
+    get_p_value(obs_t, "two_sided")
+```
+
+#### Theoretical Distribution
+
+```{r}
+t_null_theory <- fli_small %>%
+    specify(arr_delay ~ half_year) %>%
+    hypothesize(null = "independence") %>%
+    calculate(stat = "t", order = c("h1", "h2"))
+
+visualize(t_null_theory, method = "theoretical") +
+    shade_p_value(obs_t, "two_sided")
+```
+
+#### Observe Both
+
+```{r}
+visualize(t_null_perm, method = "both") +
+    shade_p_value(obs_t, direction = "two_sided")
+```
+
+#### Compute Theoretical p-value
+
+```{r}
+fli_small %>%
+    t_test(arr_delay ~ half_year,
+           alternative = "two_sided",
+           order = c("h1", "h2")) %>%
+    pull(p_value)
+```
+
+## Pipelines
+
+#### Data Prep
+
+```{r}
+fli_small <- flights %>% 
+  na.omit() %>%
+    sample_n(size = 500) %>%
+    mutate(
+        season = case_when(
+            month %in% c(10:12, 1:3) ~ "winter",
+            month %in% c(4:9) ~ "summer"
+        ),
+        day_hour = case_when(
+            between(hour, 1, 12) ~ "morning",
+            between(hour, 13, 24) ~ "not morning"
+        )) %>%
+    select(arr_delay, dep_delay, season, day_hour, origin, carrier)
+```
+
+####  Hypothesis Tests
+
+##### One Numerical Variable (Mean)
+
+Observed Stat
+
+```{r}
+x_bar <- fli_small %>%
+    specify(response = dep_delay) %>%
+    calculate(stat = "mean")
+
+null_dist <- fli_small %>%
+    specify(response = dep_delay) %>%
+    hypothesize(null = "point", mu = 10) %>%
+    generate(reps = 1000) %>%
+    calculate(stat = "mean")
+
+visualize(null_dist) +
+    shade_p_value(x_bar, "two_sided")
+
+null_dist %>%
+    get_p_value(x_bar, "two_sided")
+```
+
+##### One Numerical Value (Standardized Mean t)
