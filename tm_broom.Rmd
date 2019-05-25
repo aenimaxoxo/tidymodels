@@ -1,0 +1,540 @@
+---
+title: "Tidy Models :: broom <img src=\"broom.png\" style=\"float: right; width: 80px;\"/>"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%")
+```
+
+# {.tabset}
+        
+## Load
+
+```{r}
+library(tidyverse)
+library(tidymodels)
+library(patchwork)
+
+```
+
+## Index
+
+### Usage 
+
+`tidy()` produces a tibble where each row contains information about an important component of the model. For regression models, this is often the coefficients. 
+
+```{r}
+fit <- lm(Sepal.Width ~ Petal.Length + Petal.Width, iris)
+
+fit %>% tidy()
+```
+
+`glance()` returns a tibble with exactly one row of goodness of fitness measures and related statistics. This is useful to check for model misspecification and to compare many models. 
+
+```{r}
+fit %>% glance()
+```
+
+`augment()` adds columns to a dataset, containing information such as fitted values, residuals, or cluster assignments. All columns added to a dataset have a `.` prefix to prevent existing columns from being overwritten. 
+
+```{r}
+fit %>% augment(data = iris)
+```
+
+## Intro 
+
+### Broom : Let's Tidy Up a Bit
+
+broom is an attempt to bridge the gap from untidy outputs of predictions and estimations to the tidy data we want to work with. In contrast to reshape2 or tidyr, broom focuses on manipulating formats that are not in a data frame and convert them into tidy dataframes. 
+
+Consider an example of a linear fit on the built in mtcars dataset
+
+```{r}
+(lmfit <- lm(mpg ~ wt, mtcars))
+
+lmfit %>% summary()
+
+lmfit %>% tidy()
+```
+
+This gives us a data frame representation of our summary, as well as the ability to access our data columns via the `$` operator. 
+
+In order to access the fitted values and residuals for each of the original points in the regression we can use the `augment()` method
+
+```{r}
+lmfit %>% augment()
+```
+
+Finally, several summary statistics can be computed for the entire regression, such as $R^2$ and the F-statistic via the `glance()` function
+
+```{r}
+lmfit %>% glance()
+```
+
+### Generalized Linear and Nonlinear Models
+
+```{r}
+# fit the GLM
+
+glmfit <- glm(am ~ wt, mtcars, family = "binomial")
+
+glmfit %>% tidy()
+
+glmfit %>% augment()
+
+glmfit %>% glance()
+```
+
+Note that the statistics computed by glance() are different for GLM objects than for LM objects (e.g. deviance rather than $R^2$).
+
+We can also use these verbs on other models, like nonlinear models `nls`
+
+```{r}
+nlsfit <- nls(mpg ~ k / wt + b, mtcars, start = list(k = 1, b = 0))
+
+nlsfit %>% tidy()
+nlsfit %>% augment()
+nlsfit %>% glance()
+```
+
+### Hypothesis Testing 
+
+The tidy functions can also be applied to `htest` objects, such as those output by built in functions like `t.test`, `cor.test`, and `wilcox.test`
+
+```{r}
+tt <- t.test(wt ~ am, mtcars)
+
+tt %>% tidy()
+```
+
+Some cases may have fewer columns, such as no confidence interval
+
+```{r}
+wt <- wilcox.test(wt ~ am, mtcars)
+
+wt %>% tidy()
+
+# since the tidy output is already only one row, glance returns the same output
+wt %>% glance()
+```
+
+The `augment()` method is defined only for chi-squared tests, since there is no meaningful sense, for other tests, in which a hypothesis test produces output about each initial data point. 
+
+```{r}
+chit <- chisq.test(xtabs(Freq ~ Sex + Class, data = as.data.frame(Titanic)))
+
+chit %>% tidy()
+
+chit %>% augment()
+```
+
+### Conventions
+
+#### tidy functions 
+
+Common column names include: 
+
+- `term` : the term in a regression or model that is being estimated
+- `p.value` : this spelling was chosen to be consistent with functions in R's builtin stats package
+- `statistic` : a test statistic, usually the one used to compute the p-value. Combining these across many subgroups is a reliable way to perform bootstrap hypothesis testing
+- `estimate`, `conf.low`, `conf.high`, `df`
+
+#### augment functions
+
+augment(model, data) adds columns to the original data
+
+- If the data is missing, `augment` attempts to reconstruct the data from the model
+- it coerces column names that match data column names to `.col_name`
+
+Common column names include: 
+
+- `.fitted` : the predicted values, on the same scale as the data
+- `.resid` : the residuals : the actual y values minus the fitted values 
+- `.cluster` : cluster assignments 
+
+#### glance functions
+
+glance always returns a one row data frame
+
+- It avoids returning arguments that were given to the modeling function. For example, a glm glance output doesnt need to contain a field for family, since that is decided by the user calling glm rather than the modeling function itself. 
+
+Common column names include: 
+
+- `r.squared` : the fraction of variance explained by the model
+- `adj.r.squared` : the $R^2$ value adjusted based on degrees of freedom 
+- `sigma` : the square root of the estimated variance of the residuals 
+
+## Bootstrapping 
+
+Bootstrapping consists of randomly sampling a dataset with replacement, then performing analusis individually on each bootstrapped replicate. The variation in the resulting estimate is then a reasonable approximation of the variance of our estimate. 
+
+Lets say we wish to fit a nonlinear model to the weight/mileage relationship in the mtcars dataset. 
+
+```{r}
+# look at data
+mtcars %>% ggplot(aes(mpg, wt)) +
+    geom_point()
+
+# fit a nonlinear least squares model
+nlsfit <- nls(mpg ~ k / wt + b, mtcars, start = list(k = 1, b = 0))
+
+nlsfit %>% summary()
+
+# plot with nls
+mtcars %>%
+    ggplot(aes(wt, mpg)) +
+    geom_point() +
+    geom_line(aes(y = predict(nlsfit)))
+
+```
+
+
+While this does provide a p-value and confidence intervals for the parameters, these are based on model assumptions that may not hold on real data. We can use bootstrapping to provide intervals and predictions that are more robust to the nature of the data. 
+
+We can use the bootstraps function to sample bootstrap replications. First we conduct 100 bootstrap replications of the data, each of which has been randomly sampled with replacement. The resulting object is an rset. 
+
+```{r}
+set.seed(8888)
+
+boots <- bootstraps(mtcars, times = 100)
+
+boots %>% head()
+```
+
+We can create a helper function to fit an `nls` model on each bootstrap sample, and then use map to apply this function to all the bootstrap samples at once. Similarly, we create a column of tidy coefficient information by unnesting. 
+
+```{r}
+fit_nls_bs <- function(split) {
+    nls(mpg ~ k / wt + b, analysis(split), start = list(k = 1, b = 0))
+}
+
+# fit models and tidy them 
+boot_models <- boots %>%
+    mutate(model = map(splits, fit_nls_bs),
+           coef_info = map(model, tidy))
+
+boot_coefs <- boot_models %>%
+    unnest(coef_info)
+
+boot_coefs %>% head()
+```
+
+The unnested coefficient information contains a summary of each replication combined in a single dataframe. 
+
+We can then calculate confidence intervals (using what is called the percentile method)
+
+```{r}
+alpha <- 0.05
+boot_coefs %>%
+    group_by(term) %>%
+    summarize(low = quantile(estimate, alpha / 2),
+              high = quantile(estimate, 1 - alpha / 2))
+
+# histograms for uncertainty in estimates
+boot_coefs %>%
+    ggplot(aes(estimate)) +
+    geom_histogram(binwidth = 2) +
+    facet_wrap(~ term, scales = "free")
+
+# use augment to visualize the uncertainty in the curve
+boot_aug <- boot_models %>%
+    mutate(augmented = map(model, augment)) %>%
+    unnest(augmented)
+
+boot_aug %>% head()
+
+# plot
+boot_aug %>%
+    ggplot(aes(wt, mpg)) +
+    geom_point() +
+    geom_line(aes(y = .fitted, group = id), alpha = .2)
+```
+
+With only a few small changes, we could perform bootstrapping with other kinds of predictive or hypothesis testing models, since the tidy and augment functions work for many statistical outputs. As another example, we could use `smooth.spline`, which fits a cubic smoothing spline to data: 
+
+```{r}
+# create fitter function
+fit_spline_bs <- function(split) {
+    data <- analysis(split)
+    smooth.spline(data$wt, data$mpg, df = 4)
+}
+
+boot_splines <- boots %>%
+    mutate(spline = map(splits, fit_spline_bs),
+           aug_train = map(spline, augment))
+
+splines_aug <- boot_splines %>%
+    unnest(aug_train)
+
+splines_aug %>%
+    ggplot(aes(x, y)) +
+    geom_point() +
+    geom_line(aes(y = .fitted, group = id), alpha = 0.2)
+
+```
+
+## broom & dplyr
+
+While broom is useful for summarizing the result of a single analysis in a consistent format, it is really designed for high throughput applications where we must combine results from multiple analyses. 
+
+We can try this on a simple dataset, the built in `Orange`. This contains 35 observations of three variables: Tree, age, and circumference. Tree is a factor with 5 levels describing five trees.
+
+```{r}
+data(Orange)
+
+(Orange <- as_tibble(Orange))
+```
+
+As we might expect, age and circumference are correlated:
+
+```{r}
+cor(Orange$age, Orange$circumference)
+
+Orange %>%
+    ggplot(aes(age, circumference, color = Tree)) +
+    geom_line()
+
+```
+
+Suppose we wish to test for correlations individually within each tree. We can do this with `group_by`
+
+```{r}
+Orange %>%
+    group_by(Tree) %>%
+    summarize(correlation = cor(age, circumference))
+```
+
+Suppose that instead of simply estimating a correlation, we want to perform a hypothesis test with `cor.test`:
+
+```{r}
+(ct <- cor.test(Orange$age, Orange$circumference))
+```
+
+This contains multiple values we could want in our output. This is a nicely organized tibble using the `tidy` function: 
+
+```{r}
+ct %>% tidy()
+```
+
+Often, we want to perform multiple tests or fit multiple models, each on a different part of the data. In this case, we use a `nest-map-unnest` workflow. For example, suppose we wish to perform correlation tests for each different tree. We start by nesting our data based on the group of interest. 
+
+```{r}
+nested <- Orange %>%
+    nest(-Tree)
+```
+
+Then we run a correlation test for each nested tibble using map
+
+```{r}
+nested %>%
+    mutate(test = map(data, ~ cor.test(.x$age, .x$circumference)))
+```
+
+We want to tidy each of the objects, which we can also do with map
+
+```{r}
+nested %>%
+    mutate(
+        test = map(data, ~ cor.test(.x$age, .x$circumference)),
+        tidied = map(test, tidy)
+    )
+```
+
+Finally, we want to unnest the tidied data frames so we can see the results in a flat tibble. All together, this looks like : 
+
+```{r}
+Orange %>%
+    nest(-Tree) %>%
+    mutate(
+        test = map(data, ~ cor.test(.x$age, .x$circumference)),
+        tidied = map(test, tidy)
+    ) %>%
+    unnest(tidied, .drop = TRUE)
+```
+
+This workflow becomes even more useful when applied to regressions. Untidy output for a regression looks like: 
+
+```{r}
+lm_fit <- lm(age ~ circumference, data = Orange)
+
+lm_fit %>% summary()
+
+lm_fit %>% tidy()
+```
+
+Now we can handle multiple regressions at once using exactly the same workflow as before: 
+
+```{r}
+Orange %>%
+    nest(-Tree) %>%
+    mutate(
+        fit = map(data, ~ lm(age ~ circumference, data = .x)),
+        tidied = map(fit, tidy)
+    ) %>%
+    unnest(tidied)
+```
+
+We can easily use multiple predictors in the regressions.
+
+```{r}
+library(magrittr)
+mtcars %<>% as_tibble()
+
+mtcars %>%
+    nest(-am) %>%
+    mutate(
+        fit = map(data, ~ lm(wt ~ mpg + qsec + gear, data = .x)),
+        tidied = map(fit, tidy)
+    ) %>%
+    unnest(tidied)
+```
+
+If we want not just the tidy output, but the augment and glance outputs as well, while still performing each regression only once, we can. 
+
+```{r}
+regressions <- mtcars %>%
+    nest(-am) %>%
+    mutate(
+        fit = map(data, ~ lm(wt ~ mpg + qsec + gear, .x)),
+        tidied = map(fit, tidy),
+        glanced = map(fit, glance),
+        augmented = map(fit, augment)
+    )
+
+regressions %>%
+    unnest(tidied)
+
+regressions %>%
+    unnest(glanced)
+
+regressions %>%
+    unnest(augmented)
+
+```
+
+By combining the estimates and p-values across all groups into the same tidy data frame, a new class of analyses and visualizations becomes straightforward. This includes 
+
+- sorting by p-value or estimate to find the most significant terms across all tests
+- p-value histograms 
+- volcano plots comparing p-values to effect size estimates
+
+## kmeans
+
+Let's start by generating some random two dimensional data with three clusters. Data in each cluster will come from a multivariate gaussian distribution, with different means for each cluster. 
+
+```{r}
+set.seed(8888)
+
+centers <- tibble(
+    cluster = factor(1:3),
+    # num points in each cluster
+    num_points = c(100, 150, 50),
+    # coordinates
+    x1 = c(5, 0, -3),
+    x2 = c(-1, 1, -2)
+)
+
+labelled_points <- centers %>%
+    mutate(
+        x1 = map2(num_points, x1, rnorm),
+        x2 = map2(num_points, x2, rnorm)
+    ) %>%
+    select(-num_points) %>%
+    unnest(x1, x2)
+
+labelled_points %>%
+    ggplot(aes(x1, x2, color = cluster)) +
+    geom_point()
+```
+
+This is an idealized case for k-means clustering. We'll use the built in kmeans function, which accepts a dataframe with all numeric columns as its primary argument. 
+
+```{r}
+labelled_points %>%
+    select(-cluster) -> points
+
+(kclust <- kmeans(points, centers = 3))
+
+kclust %>% summary()
+
+```
+
+- `cluster` : 300 values contains information about each point 
+- `centers, withinss, and size` contain information about each cluster 
+- `totss, tot.withinss, betweenss, and iter` contain information about the full clustering
+
+We may want to extract any of these metrics for a number of different reasons. `augment` adds the point classifications to the original dataset: 
+
+```{r}
+augment(kclust, points) %>% head()
+```
+
+The `tidy` function summarizes on a per cluster level 
+
+```{r}
+kclust %>% tidy()
+```
+
+The `glance` function extracts a single row summary 
+
+```{r}
+kclust %>% glance()
+```
+
+### broom and dplyr for exploratory clustering 
+
+While these summaries are useful, they would not be difficult to extract from the dataset ourselves. The power comes from combining our analyses with dplyr. 
+
+Let's say we wish to explore the effect of different choices of k, from 1 to 9, on this clustering. First we cluster the data 9 times, each using a different value of k, then create columns containing the tidied, glanced, and augmented data. 
+
+```{r}
+(kclusts <- tibble(k = 1:9) %>%
+    mutate(
+        kclust = map(k, ~ kmeans(points, .x)),
+        tidied = map(kclust, tidy),
+        glanced = map(kclust, glance),
+        augmented = map(kclust, augment, points)
+    ))
+```
+
+We can turn these into three separate datasets representing a different type of data, then tidy the clusterings three ways: using tidy, augment, and glance. Each of these goes into a separate dataset as they represent different types of data.
+
+```{r}
+kclusts %>%
+    unnest(tidied) -> clusters
+
+kclusts %>%
+    unnest(augmented) -> assignments
+
+kclusts %>%
+    unnest(glanced, .drop = TRUE) -> clusterings
+```
+
+Now we can plot the original points, with each point colored according to the predicted cluster. 
+
+```{r}
+p1 <- ggplot(assignments, aes(x1, x2)) +
+    geom_point(aes(color = .cluster)) +
+    facet_wrap(~ k)
+
+p2 <- p1 + geom_point(data = clusters, size = 10, shape = "x")
+
+p1 + p2
+```
+
+The data from glance fits a different, but equally important purpose: it lets us view trends of some summary statistics across values of k. Of particular interest is the total within sum of squares, from the `tot.withinss` column. 
+
+```{r}
+clusterings %>%
+    ggplot(aes(k, tot.withinss)) +
+    geom_line()
+```
+
+This represents the variance within the clusters. It decreases as k increases, but one can still notice a bend right at k = 3. This bend indicates that additional clusters beyond the 3rd have little value. 
