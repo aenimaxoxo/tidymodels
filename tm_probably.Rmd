@@ -1,0 +1,33 @@
+---
+title: "Tidy Models :: probably"
+author: "Michael Rose"
+output: 
+  html_document:
+     highlight: zenburn
+     theme: lumen
+     df_print: paged
+     fig_align: center
+---
+
+```{r, echo = FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, out.width = "100%")
+```
+
+# {.tabset}
+        
+## Index
+
+`probably` contains tools to facilitate activities such as: 
+
+- conversion of probabilities to discrete class predictions
+- investigating and estimating optimal probability thresholds 
+- inclusion of equivocal zones where the probabilities are too uncertain to report a prediction
+
+### Load 
+
+```{r}
+library(vctrs)
+library(probably)
+library(tidyverse)
+library(magrittr)
+```
